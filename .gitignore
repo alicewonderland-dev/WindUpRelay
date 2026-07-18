@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+
+# Local production secrets and durable runtime state.
+appsettings.Production.json
+*.db
+*.db-shm
+*.db-wal
+*.log
