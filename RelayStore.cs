@@ -1,7 +1,8 @@
 using Microsoft.Data.Sqlite;
 
 /// <summary>
-/// SQLite persistence for durable pairs, pending submits, offline outbox, rate limits, and ops events.
+/// SQLite persistence for durable pairs, doll consent, wind expiry, pending submits,
+/// offline outbox, rate limits, and ops events.
 /// Never stores Name@World, ContentId, or relay tokens.
 /// </summary>
 internal sealed class RelayStore : IDisposable
@@ -90,6 +91,11 @@ internal sealed class RelayStore : IDisposable
                   PRIMARY KEY (pairing_key, window_start)
                 );
 
+                CREATE TABLE IF NOT EXISTS wind_request_cooldowns (
+                  pairing_key TEXT PRIMARY KEY,
+                  last_request_utc TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS relay_events (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   utc TEXT NOT NULL,
@@ -102,6 +108,23 @@ internal sealed class RelayStore : IDisposable
 
                 CREATE INDEX IF NOT EXISTS ix_relay_events_utc
                   ON relay_events(utc);
+
+                CREATE TABLE IF NOT EXISTS doll_wind (
+                  pairing_key TEXT PRIMARY KEY,
+                  expiry_utc TEXT,
+                  updated_utc TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS pair_consent (
+                  doll_key TEXT NOT NULL,
+                  peer_key TEXT NOT NULL,
+                  can_wind INTEGER NOT NULL,
+                  can_unwind INTEGER NOT NULL,
+                  is_owner INTEGER NOT NULL,
+                  can_call INTEGER NOT NULL,
+                  updated_utc TEXT NOT NULL,
+                  PRIMARY KEY (doll_key, peer_key)
+                );
                 """;
             cmd.ExecuteNonQuery();
         }
@@ -136,6 +159,35 @@ internal sealed class RelayStore : IDisposable
                 "SELECT 1 FROM pair_submits WHERE my_key = $my AND their_key = $their LIMIT 1;";
             cmd.Parameters.AddWithValue("$my", myKey);
             cmd.Parameters.AddWithValue("$their", theirKey);
+            return cmd.ExecuteScalar() is not null;
+        }
+    }
+
+    public void CancelPairSubmit(string myKey, string theirKey)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                "DELETE FROM pair_submits WHERE my_key = $my AND their_key = $their;";
+            cmd.Parameters.AddWithValue("$my", myKey);
+            cmd.Parameters.AddWithValue("$their", theirKey);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public bool HasEstablishedPair(string a, string b)
+    {
+        Canonical(a, b, out var lo, out var hi);
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                "SELECT 1 FROM pairs WHERE key_lo = $lo AND key_hi = $hi LIMIT 1;";
+            cmd.Parameters.AddWithValue("$lo", lo);
+            cmd.Parameters.AddWithValue("$hi", hi);
             return cmd.ExecuteScalar() is not null;
         }
     }
@@ -228,7 +280,180 @@ internal sealed class RelayStore : IDisposable
                 clear.ExecuteNonQuery();
             }
 
+            using (var consent = conn.CreateCommand())
+            {
+                consent.Transaction = tx;
+                consent.CommandText =
+                    """
+                    DELETE FROM pair_consent
+                    WHERE (doll_key = $a AND peer_key = $b)
+                       OR (doll_key = $b AND peer_key = $a);
+                    """;
+                consent.Parameters.AddWithValue("$a", a);
+                consent.Parameters.AddWithValue("$b", b);
+                consent.ExecuteNonQuery();
+            }
+
             tx.Commit();
+        }
+    }
+
+    /// <summary>Last-write-wins merge of doll wind expiry. Returns true when the store changed.</summary>
+    public bool TryMergeDollWind(string pairingKey, string? expiryUtc, string updatedUtc)
+    {
+        if (!TryParseUtc(updatedUtc, out var inboundUpdated))
+            return false;
+
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            DateTimeOffset? storedUpdated = null;
+            using (var sel = conn.CreateCommand())
+            {
+                sel.Transaction = tx;
+                sel.CommandText = "SELECT updated_utc FROM doll_wind WHERE pairing_key = $k;";
+                sel.Parameters.AddWithValue("$k", pairingKey);
+                if (sel.ExecuteScalar() is string raw && TryParseUtc(raw, out var parsed))
+                    storedUpdated = parsed;
+            }
+
+            if (storedUpdated is { } existing && inboundUpdated <= existing)
+            {
+                tx.Commit();
+                return false;
+            }
+
+            using (var upsert = conn.CreateCommand())
+            {
+                upsert.Transaction = tx;
+                upsert.CommandText =
+                    """
+                    INSERT INTO doll_wind (pairing_key, expiry_utc, updated_utc)
+                    VALUES ($k, $exp, $upd)
+                    ON CONFLICT(pairing_key) DO UPDATE SET
+                      expiry_utc = excluded.expiry_utc,
+                      updated_utc = excluded.updated_utc;
+                    """;
+                upsert.Parameters.AddWithValue("$k", pairingKey);
+                upsert.Parameters.AddWithValue("$exp", (object?)expiryUtc ?? DBNull.Value);
+                upsert.Parameters.AddWithValue("$upd", inboundUpdated.ToString("O"));
+                upsert.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            return true;
+        }
+    }
+
+    public DollWindRow? GetDollWind(string pairingKey)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                "SELECT expiry_utc, updated_utc FROM doll_wind WHERE pairing_key = $k;";
+            cmd.Parameters.AddWithValue("$k", pairingKey);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read())
+                return null;
+
+            return new DollWindRow(
+                pairingKey,
+                reader.IsDBNull(0) ? null : reader.GetString(0),
+                reader.GetString(1));
+        }
+    }
+
+    /// <summary>Last-write-wins merge of directed doll consent toward a peer.</summary>
+    public bool TryMergePairConsent(PairConsentRow inbound)
+    {
+        if (!TryParseUtc(inbound.UpdatedUtc, out var inboundUpdated))
+            return false;
+
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            DateTimeOffset? storedUpdated = null;
+            using (var sel = conn.CreateCommand())
+            {
+                sel.Transaction = tx;
+                sel.CommandText =
+                    "SELECT updated_utc FROM pair_consent WHERE doll_key = $d AND peer_key = $p;";
+                sel.Parameters.AddWithValue("$d", inbound.DollKey);
+                sel.Parameters.AddWithValue("$p", inbound.PeerKey);
+                if (sel.ExecuteScalar() is string raw && TryParseUtc(raw, out var parsed))
+                    storedUpdated = parsed;
+            }
+
+            if (storedUpdated is { } existing && inboundUpdated <= existing)
+            {
+                tx.Commit();
+                return false;
+            }
+
+            using (var upsert = conn.CreateCommand())
+            {
+                upsert.Transaction = tx;
+                upsert.CommandText =
+                    """
+                    INSERT INTO pair_consent
+                      (doll_key, peer_key, can_wind, can_unwind, is_owner, can_call, updated_utc)
+                    VALUES
+                      ($d, $p, $w, $u, $o, $c, $upd)
+                    ON CONFLICT(doll_key, peer_key) DO UPDATE SET
+                      can_wind = excluded.can_wind,
+                      can_unwind = excluded.can_unwind,
+                      is_owner = excluded.is_owner,
+                      can_call = excluded.can_call,
+                      updated_utc = excluded.updated_utc;
+                    """;
+                upsert.Parameters.AddWithValue("$d", inbound.DollKey);
+                upsert.Parameters.AddWithValue("$p", inbound.PeerKey);
+                upsert.Parameters.AddWithValue("$w", inbound.CanWind ? 1 : 0);
+                upsert.Parameters.AddWithValue("$u", inbound.CanUnwind ? 1 : 0);
+                upsert.Parameters.AddWithValue("$o", inbound.IsOwner ? 1 : 0);
+                upsert.Parameters.AddWithValue("$c", inbound.CanCall ? 1 : 0);
+                upsert.Parameters.AddWithValue("$upd", inboundUpdated.ToString("O"));
+                upsert.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            return true;
+        }
+    }
+
+    public IReadOnlyList<PairConsentRow> GetPairConsentForDoll(string dollKey)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                """
+                SELECT peer_key, can_wind, can_unwind, is_owner, can_call, updated_utc
+                FROM pair_consent
+                WHERE doll_key = $d
+                ORDER BY peer_key;
+                """;
+            cmd.Parameters.AddWithValue("$d", dollKey);
+            var list = new List<PairConsentRow>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                list.Add(new PairConsentRow(
+                    dollKey,
+                    reader.GetString(0),
+                    reader.GetInt64(1) != 0,
+                    reader.GetInt64(2) != 0,
+                    reader.GetInt64(3) != 0,
+                    reader.GetInt64(4) != 0,
+                    reader.GetString(5)));
+            }
+
+            return list;
         }
     }
 
@@ -278,75 +503,6 @@ internal sealed class RelayStore : IDisposable
             }
 
             return list;
-        }
-    }
-
-    public void ReplaceKeyInPairs(string oldKey, string newKey)
-    {
-        if (string.Equals(oldKey, newKey, StringComparison.Ordinal))
-            return;
-
-        lock (_gate)
-        {
-            using var conn = Open();
-            using var tx = conn.BeginTransaction();
-
-            var peers = new List<string>();
-            using (var q = conn.CreateCommand())
-            {
-                q.Transaction = tx;
-                q.CommandText =
-                    """
-                    SELECT CASE WHEN key_lo = $k THEN key_hi ELSE key_lo END
-                    FROM pairs WHERE key_lo = $k OR key_hi = $k;
-                    """;
-                q.Parameters.AddWithValue("$k", oldKey);
-                using var reader = q.ExecuteReader();
-                while (reader.Read())
-                    peers.Add(reader.GetString(0));
-            }
-
-            using (var del = conn.CreateCommand())
-            {
-                del.Transaction = tx;
-                del.CommandText = "DELETE FROM pairs WHERE key_lo = $k OR key_hi = $k;";
-                del.Parameters.AddWithValue("$k", oldKey);
-                del.ExecuteNonQuery();
-            }
-
-            foreach (var peer in peers)
-            {
-                if (string.Equals(peer, newKey, StringComparison.Ordinal))
-                    continue;
-                Canonical(newKey, peer, out var lo, out var hi);
-                using var ins = conn.CreateCommand();
-                ins.Transaction = tx;
-                ins.CommandText =
-                    """
-                    INSERT INTO pairs (key_lo, key_hi, established_utc)
-                    VALUES ($lo, $hi, $utc)
-                    ON CONFLICT(key_lo, key_hi) DO NOTHING;
-                    """;
-                ins.Parameters.AddWithValue("$lo", lo);
-                ins.Parameters.AddWithValue("$hi", hi);
-                ins.Parameters.AddWithValue("$utc", UtcNow());
-                ins.ExecuteNonQuery();
-            }
-
-            using (var submits = conn.CreateCommand())
-            {
-                submits.Transaction = tx;
-                submits.CommandText =
-                    """
-                    UPDATE pair_submits SET my_key = $new WHERE my_key = $old;
-                    UPDATE pair_submits SET their_key = $new WHERE their_key = $old;
-                    """;
-                submits.Parameters.AddWithValue("$new", newKey);
-                submits.Parameters.AddWithValue("$old", oldKey);
-                submits.ExecuteNonQuery();
-            }
-
-            tx.Commit();
         }
     }
 
@@ -535,6 +691,54 @@ internal sealed class RelayStore : IDisposable
         }
     }
 
+    /// <summary>Atomically permits at most one wind request per pairing key per cooldown period.</summary>
+    public bool TryConsumeWindRequest(string pairingKey, TimeSpan cooldown)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            DateTimeOffset? lastRequest = null;
+            using (var select = conn.CreateCommand())
+            {
+                select.Transaction = tx;
+                select.CommandText =
+                    "SELECT last_request_utc FROM wind_request_cooldowns WHERE pairing_key = $key;";
+                select.Parameters.AddWithValue("$key", pairingKey);
+                if (select.ExecuteScalar() is string raw
+                    && DateTimeOffset.TryParse(raw, out var parsed))
+                {
+                    lastRequest = parsed;
+                }
+            }
+
+            if (lastRequest is { } last && now - last < cooldown)
+            {
+                tx.Commit();
+                return false;
+            }
+
+            using (var upsert = conn.CreateCommand())
+            {
+                upsert.Transaction = tx;
+                upsert.CommandText =
+                    """
+                    INSERT INTO wind_request_cooldowns (pairing_key, last_request_utc)
+                    VALUES ($key, $utc)
+                    ON CONFLICT(pairing_key)
+                    DO UPDATE SET last_request_utc = excluded.last_request_utc;
+                    """;
+                upsert.Parameters.AddWithValue("$key", pairingKey);
+                upsert.Parameters.AddWithValue("$utc", now.ToString("O"));
+                upsert.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+            return true;
+        }
+    }
+
     public void RecordEvent(string kind, string? pairingKey = null, string? peerKey = null, string? msgType = null, string? detail = null)
     {
         lock (_gate)
@@ -608,6 +812,9 @@ internal sealed class RelayStore : IDisposable
     }
 
     private static string UtcNow() => DateTimeOffset.UtcNow.ToString("O");
+
+    private static bool TryParseUtc(string raw, out DateTimeOffset value)
+        => DateTimeOffset.TryParse(raw, out value);
 }
 
 internal readonly record struct OutboxRow(
@@ -616,6 +823,20 @@ internal readonly record struct OutboxRow(
     string FromKey,
     string MsgType,
     string EnvelopeJson);
+
+internal readonly record struct DollWindRow(
+    string PairingKey,
+    string? ExpiryUtc,
+    string UpdatedUtc);
+
+internal readonly record struct PairConsentRow(
+    string DollKey,
+    string PeerKey,
+    bool CanWind,
+    bool CanUnwind,
+    bool IsOwner,
+    bool CanCall,
+    string UpdatedUtc);
 
 internal readonly record struct RelayStats(
     long Pairs,

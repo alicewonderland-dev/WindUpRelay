@@ -93,6 +93,7 @@ static bool IsAuthorized(HttpContext context, string relayToken)
 internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesPerMinute)
 {
     private static readonly TimeSpan WindOutboxTtl = TimeSpan.FromDays(7);
+    private static readonly TimeSpan WindRequestCooldown = TimeSpan.FromHours(1);
     private static readonly TimeSpan OwnerOutboxTtl = TimeSpan.FromDays(14);
     private static readonly TimeSpan PairOutboxTtl = TimeSpan.FromDays(30);
 
@@ -189,6 +190,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             case MessageTypes.Wind:
                 await HandleWindAsync(session, envelope, ct);
                 break;
+            case MessageTypes.WindRequest:
+                await HandleWindRequestAsync(session, envelope, ct);
+                break;
             case MessageTypes.Unwind:
                 await HandleUnwindAsync(session, envelope, ct);
                 break;
@@ -204,14 +208,20 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             case MessageTypes.OwnerSettingsUpdate:
                 await HandleOwnerSettingsUpdateAsync(session, envelope, ct);
                 break;
-            case MessageTypes.KeyRotated:
-                await HandleKeyRotatedAsync(session, envelope, ct);
+            case MessageTypes.Call:
+                await HandleCallAsync(session, envelope, ct);
                 break;
             case MessageTypes.PairSubmit:
                 await HandlePairSubmitAsync(session, envelope, ct);
                 break;
+            case MessageTypes.PairCancel:
+                HandlePairCancel(session, envelope);
+                break;
             case MessageTypes.PairRemove:
                 await HandlePairRemoveAsync(session, envelope, ct);
+                break;
+            case MessageTypes.DollStatePush:
+                HandleDollStatePush(session, envelope);
                 break;
             case MessageTypes.PresenceQuery:
                 await HandlePresenceQueryAsync(session, envelope, ct);
@@ -220,6 +230,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             case MessageTypes.WindResult:
             case MessageTypes.OwnerSettingsResult:
             case MessageTypes.OwnerSettingsAck:
+            case MessageTypes.CallAck:
+            case MessageTypes.CallResult:
             case MessageTypes.Error:
                 await RouteByKeyAsync(envelope, ct);
                 break;
@@ -271,16 +283,79 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         log.LogInformation("Registered key={Key}", pairingKey);
 
         var peers = store.GetPeerKeys(pairingKey);
-        if (peers.Count > 0)
+        var consent = store.GetPairConsentForDoll(pairingKey);
+        var wind = store.GetDollWind(pairingKey);
+        var peerKeys = peers.Count > 0
+            ? peers.ToList()
+            : consent.Select(c => c.PeerKey).Distinct(StringComparer.Ordinal).OrderBy(k => k).ToList();
+
+        await session.SendAsync(Envelope.Create(MessageTypes.PairSync, new PairSyncPayload
         {
-            await session.SendAsync(Envelope.Create(MessageTypes.PairSync, new PairSyncPayload
+            PeerKeys = peerKeys,
+            Peers = consent.Select(c => new PairConsentSyncEntry
             {
-                PeerKeys = peers.ToList(),
-            }), ct);
-        }
+                PeerKey = c.PeerKey,
+                CanWindMe = c.CanWind,
+                CanUnwindMe = c.CanUnwind,
+                IsOwner = c.IsOwner,
+                CanCallMe = c.CanCall,
+                UpdatedUtc = c.UpdatedUtc,
+            }).ToList(),
+            ExpiryUtc = wind?.ExpiryUtc,
+            WindUpdatedUtc = wind?.UpdatedUtc,
+        }), ct);
 
         await TryCompletePendingForAsync(session, ct);
         await FlushOutboxAsync(session, ct);
+    }
+
+    private void HandleDollStatePush(ClientSession session, Envelope envelope)
+    {
+        if (session.PairingKey is not { } dollKey)
+            return;
+
+        var payload = envelope.GetPayload<DollStatePushPayload>();
+        if (payload is null)
+            return;
+
+        if (!string.IsNullOrEmpty(payload.WindUpdatedUtc))
+        {
+            string? expiryUtc = payload.ClearWind ? null : payload.ExpiryUtc;
+            if (store.TryMergeDollWind(dollKey, expiryUtc, payload.WindUpdatedUtc))
+            {
+                store.RecordEvent(
+                    "doll_wind_merge",
+                    pairingKey: dollKey,
+                    msgType: MessageTypes.DollStatePush,
+                    detail: payload.ClearWind ? "clear" : "set");
+            }
+        }
+
+        if (payload.Peers is null || payload.Peers.Count == 0)
+            return;
+
+        foreach (var peer in payload.Peers)
+        {
+            var peerKey = NormalizePairingKey(peer.PeerKey);
+            if (peerKey.Length != 8 || string.Equals(peerKey, dollKey, StringComparison.Ordinal))
+                continue;
+
+            if (store.TryMergePairConsent(new PairConsentRow(
+                    dollKey,
+                    peerKey,
+                    peer.CanWindMe,
+                    peer.CanUnwindMe,
+                    peer.IsOwner,
+                    peer.CanCallMe,
+                    peer.UpdatedUtc)))
+            {
+                store.RecordEvent(
+                    "pair_consent_merge",
+                    pairingKey: dollKey,
+                    peerKey: peerKey,
+                    msgType: MessageTypes.DollStatePush);
+            }
+        }
     }
 
     private async Task HandlePairSubmitAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -334,6 +409,20 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         foreach (var (myKey, theirKey) in store.GetMutualPendingFor(session.PairingKey))
             await EstablishPairAsync(myKey, theirKey, ct);
+    }
+
+    private void HandlePairCancel(ClientSession session, Envelope envelope)
+    {
+        if (session.PairingKey is null)
+            return;
+
+        var payload = envelope.GetPayload<PairCancelPayload>();
+        var peerKey = NormalizePairingKey(payload?.PeerKey);
+        if (peerKey.Length != 8 || string.Equals(peerKey, session.PairingKey, StringComparison.Ordinal))
+            return;
+
+        store.CancelPairSubmit(session.PairingKey, peerKey);
+        store.RecordEvent("pair_cancel", pairingKey: session.PairingKey, peerKey: peerKey);
     }
 
     private async Task EstablishPairAsync(string a, string b, CancellationToken ct)
@@ -502,6 +591,68 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         await DeliverOrQueueAsync(session, payload.RequestId, payload.To, MessageTypes.Unwind, forward, WindOutboxTtl, ct);
     }
 
+    private async Task HandleWindRequestAsync(ClientSession session, Envelope envelope, CancellationToken ct)
+    {
+        if (session.PairingKey is null)
+        {
+            await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+            {
+                Code = ErrorCodes.NotRegistered,
+                Message = "register before sending windRequest",
+            }), ct);
+            return;
+        }
+
+        var payload = envelope.GetPayload<WindRequestPayload>();
+        if (payload is null
+            || string.IsNullOrWhiteSpace(payload.RequestId)
+            || string.IsNullOrWhiteSpace(payload.To)
+            || payload.PercentRemaining is < 0 or > 100)
+        {
+            await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+            {
+                RequestId = payload?.RequestId,
+                Code = ErrorCodes.BadRequest,
+                Message = "invalid windRequest payload",
+            }), ct);
+            return;
+        }
+
+        payload.From = session.PairingKey;
+        payload.To = NormalizePairingKey(payload.To);
+        if (!store.HasEstablishedPair(session.PairingKey, payload.To))
+        {
+            await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+            {
+                RequestId = payload.RequestId,
+                Code = ErrorCodes.NotAllowed,
+                Message = "wind requests require an established pair",
+            }), ct);
+            return;
+        }
+
+        if (!store.TryConsumeWindRequest(session.PairingKey, WindRequestCooldown))
+        {
+            await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+            {
+                RequestId = payload.RequestId,
+                Code = ErrorCodes.WindRequestCooldown,
+                Message = "wind requests are limited to one per hour",
+            }), ct);
+            return;
+        }
+
+        var forward = Envelope.Create(MessageTypes.WindRequest, payload);
+        await DeliverOrQueueAsync(
+            session,
+            payload.RequestId,
+            payload.To,
+            MessageTypes.WindRequest,
+            forward,
+            WindOutboxTtl,
+            ct);
+    }
+
     private async Task HandleOwnerGrantAsync(ClientSession session, Envelope envelope, CancellationToken ct)
     {
         if (session.PairingKey is null)
@@ -632,62 +783,48 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         await DeliverOrQueueAsync(session, payload.RequestId, payload.To, MessageTypes.OwnerSettingsUpdate, forward, OwnerOutboxTtl, ct);
     }
 
-    private async Task HandleKeyRotatedAsync(ClientSession session, Envelope envelope, CancellationToken ct)
+    /// <summary>Live-only: never queue stale summons.</summary>
+    private async Task HandleCallAsync(ClientSession session, Envelope envelope, CancellationToken ct)
     {
         if (session.PairingKey is null)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
                 Code = ErrorCodes.NotRegistered,
-                Message = "register before keyRotated",
+                Message = "register before sending call",
             }), ct);
             return;
         }
 
-        var payload = envelope.GetPayload<KeyRotatedPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To))
+        var payload = envelope.GetPayload<CallPayload>();
+        if (payload is null || string.IsNullOrWhiteSpace(payload.To) || payload.WorldId == 0 || payload.TerritoryId == 0)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
+                RequestId = payload?.RequestId,
                 Code = ErrorCodes.BadRequest,
-                Message = "invalid keyRotated payload",
-            }), ct);
-            return;
-        }
-
-        var oldKey = NormalizePairingKey(payload.OldKey);
-        var newKey = NormalizePairingKey(payload.NewKey);
-        if (oldKey.Length != 8 || newKey.Length != 8 || !string.Equals(newKey, session.PairingKey, StringComparison.Ordinal))
-        {
-            await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
-            {
-                Code = ErrorCodes.BadRequest,
-                Message = "keyRotated newKey must match registered key",
+                Message = "invalid call payload",
             }), ct);
             return;
         }
 
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
-        payload.OldKey = oldKey;
-        payload.NewKey = newKey;
+        var forward = Envelope.Create(MessageTypes.Call, payload);
 
-        store.ReplaceKeyInPairs(oldKey, newKey);
-        store.RecordEvent("key_rotated", pairingKey: newKey, peerKey: payload.To, detail: "pairs_updated");
-
-        // Strip identity from durable queue; keep on live forward for partner local label.
-        var identity = payload.Identity;
         if (_byPairingKey.TryGetValue(payload.To, out var target) && target.IsOpen)
         {
-            await target.SendAsync(Envelope.Create(MessageTypes.KeyRotated, payload), ct);
+            await target.SendAsync(forward, ct);
             return;
         }
 
-        payload.Identity = null;
-        var queued = Envelope.Create(MessageTypes.KeyRotated, payload);
-        store.EnqueueOutbox(null, session.PairingKey, payload.To, MessageTypes.KeyRotated, queued.Serialize(), PairOutboxTtl);
-        store.RecordEvent("queue", pairingKey: session.PairingKey, peerKey: payload.To, msgType: MessageTypes.KeyRotated);
-        _ = identity;
+        await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+        {
+            RequestId = payload.RequestId,
+            To = session.PairingKey,
+            Code = ErrorCodes.TargetOffline,
+            Message = "doll is offline",
+        }), ct);
     }
 
     private async Task DeliverOrQueueAsync(
@@ -783,6 +920,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             MessageTypes.PresenceResult => NormalizePairingKey(envelope.GetPayload<PresenceResultPayload>()?.To),
             MessageTypes.OwnerSettingsResult => NormalizePairingKey(envelope.GetPayload<OwnerSettingsResultPayload>()?.To),
             MessageTypes.OwnerSettingsAck => NormalizePairingKey(envelope.GetPayload<OwnerSettingsAckPayload>()?.To),
+            MessageTypes.CallAck => NormalizePairingKey(envelope.GetPayload<CallAckPayload>()?.To),
+            MessageTypes.CallResult => NormalizePairingKey(envelope.GetPayload<CallResultPayload>()?.To),
             MessageTypes.Error => NormalizePairingKey(envelope.GetPayload<ErrorPayload>()?.To),
             _ => null,
         };
@@ -798,6 +937,14 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             var rid = envelope.Type == MessageTypes.OwnerSettingsResult
                 ? envelope.GetPayload<OwnerSettingsResultPayload>()?.RequestId
                 : envelope.GetPayload<OwnerSettingsAckPayload>()?.RequestId;
+            if (!string.IsNullOrEmpty(rid))
+                store.MarkAckedByRequestId(rid);
+        }
+        else if (envelope.Type is MessageTypes.CallAck or MessageTypes.CallResult)
+        {
+            var rid = envelope.Type == MessageTypes.CallAck
+                ? envelope.GetPayload<CallAckPayload>()?.RequestId
+                : envelope.GetPayload<CallResultPayload>()?.RequestId;
             if (!string.IsNullOrEmpty(rid))
                 store.MarkAckedByRequestId(rid);
         }
