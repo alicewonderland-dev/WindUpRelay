@@ -27,13 +27,13 @@ Build explicitly with:
 ./Start-WindUpHost.sh
 ```
 
-That opens a Start/Stop window, starts the Production relay on `:8787`, and enables
+That opens a Start/Stop window, starts the Production relay on `:29417`, and enables
 Tailscale Funnel (same flow as the Windows tray host).
 
 Terminal-only alternative:
 
 ```bash
-./Start-WindUpRelay.sh           # Production relay on :8787
+./Start-WindUpRelay.sh           # Production relay on :29417
 ./Start-WindUpRelay.sh --funnel  # also enable Tailscale Funnel
 ```
 

@@ -5,7 +5,7 @@ using WindUpKey.Protocol;
 
 var builder = WebApplication.CreateBuilder(args);
 var relayToken = builder.Configuration["Relay:Token"] ?? string.Empty;
-var urls = builder.Configuration["Relay:Urls"] ?? "http://127.0.0.1:8787";
+var urls = builder.Configuration["Relay:Urls"] ?? "http://127.0.0.1:29417";
 var dbPathConfig = builder.Configuration["Relay:DatabasePath"];
 var dbPath = string.IsNullOrWhiteSpace(dbPathConfig)
     ? Path.Combine(AppContext.BaseDirectory, "windup-relay.db")
