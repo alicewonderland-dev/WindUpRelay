@@ -2,8 +2,8 @@ using Microsoft.Data.Sqlite;
 
 /// <summary>
 /// SQLite persistence for durable pairs, doll consent, wind expiry, pending submits,
-/// offline outbox, rate limits, and ops events.
-/// Never stores Name@World, ContentId, or relay tokens.
+/// offline outbox, rate limits, relay accounts, and ops events.
+/// Never stores Name@World, ContentId, relay tokens, or raw relay secrets (accounts keep only SHA-256 hex).
 /// </summary>
 internal sealed class RelayStore : IDisposable
 {
@@ -125,8 +125,77 @@ internal sealed class RelayStore : IDisposable
                   updated_utc TEXT NOT NULL,
                   PRIMARY KEY (doll_key, peer_key)
                 );
+
+                CREATE TABLE IF NOT EXISTS accounts (
+                  pairing_key TEXT PRIMARY KEY,
+                  secret_hash TEXT NOT NULL,
+                  created_utc TEXT NOT NULL,
+                  last_seen_utc TEXT NOT NULL
+                );
                 """;
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Secret hash (hex) of the account for this key, or null when the key is unclaimed.</summary>
+    public string? GetAccountSecretHash(string pairingKey)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT secret_hash FROM accounts WHERE pairing_key = $k;";
+            cmd.Parameters.AddWithValue("$k", pairingKey);
+            return cmd.ExecuteScalar() as string;
+        }
+    }
+
+    /// <summary>
+    /// Insert-if-absent. Returns false when the key already has an account (e.g. a concurrent first bind won);
+    /// callers re-read with <see cref="GetAccountSecretHash"/> and decide again.
+    /// </summary>
+    public bool TryCreateAccount(string pairingKey, string secretHash)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                """
+                INSERT INTO accounts (pairing_key, secret_hash, created_utc, last_seen_utc)
+                VALUES ($k, $h, $utc, $utc)
+                ON CONFLICT(pairing_key) DO NOTHING;
+                """;
+            cmd.Parameters.AddWithValue("$k", pairingKey);
+            cmd.Parameters.AddWithValue("$h", secretHash);
+            cmd.Parameters.AddWithValue("$utc", UtcNow());
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    public void TouchAccount(string pairingKey)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE accounts SET last_seen_utc = $utc WHERE pairing_key = $k;";
+            cmd.Parameters.AddWithValue("$k", pairingKey);
+            cmd.Parameters.AddWithValue("$utc", UtcNow());
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>Admin reset: the next authenticated register claims the key again. Returns false when absent.</summary>
+    public bool DeleteAccount(string pairingKey)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM accounts WHERE pairing_key = $k;";
+            cmd.Parameters.AddWithValue("$k", pairingKey);
+            return cmd.ExecuteNonQuery() > 0;
         }
     }
 
@@ -775,6 +844,7 @@ internal sealed class RelayStore : IDisposable
         {
             ExpireLocked();
             using var conn = Open();
+            var cut = DateTimeOffset.UtcNow.AddHours(-24).ToString("O");
             return new RelayStats(
                 Count(conn, "SELECT COUNT(*) FROM pairs"),
                 Count(conn, "SELECT COUNT(*) FROM pair_submits"),
@@ -782,8 +852,9 @@ internal sealed class RelayStore : IDisposable
                 Count(conn, "SELECT COUNT(*) FROM outbox WHERE status = 'delivered'"),
                 Count(conn, "SELECT COUNT(*) FROM outbox WHERE status = 'acked'"),
                 Count(conn, "SELECT COUNT(*) FROM outbox WHERE status = 'expired'"),
-                Count(conn, "SELECT COUNT(*) FROM relay_events WHERE utc >= $cut",
-                    ("$cut", DateTimeOffset.UtcNow.AddHours(-24).ToString("O"))));
+                Count(conn, "SELECT COUNT(*) FROM relay_events WHERE utc >= $cut", ("$cut", cut)),
+                Count(conn, "SELECT COUNT(*) FROM accounts"),
+                Count(conn, "SELECT COUNT(*) FROM accounts WHERE created_utc >= $cut", ("$cut", cut)));
         }
     }
 
@@ -845,4 +916,6 @@ internal readonly record struct RelayStats(
     long OutboxDelivered,
     long OutboxAcked,
     long OutboxExpired,
-    long EventsLast24h);
+    long EventsLast24h,
+    long Accounts,
+    long AccountsClaimedLast24h);

@@ -4,7 +4,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <RootNamespace>WindUpRelay</RootNamespace>
+    <!-- Keep the test project out of SDK globbing (sources, content, bin/obj). -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="WindUpRelay.Tests" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\WindUpKey.Protocol\WindUpKey.Protocol.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />

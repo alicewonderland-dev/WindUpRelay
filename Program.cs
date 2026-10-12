@@ -3,6 +3,29 @@ using System.Net.WebSockets;
 using System.Text;
 using WindUpKey.Protocol;
 
+// Admin CLI: `reset-account <PAIRINGKEY>` uses the server's configuration but never starts the host.
+// It is recognised anywhere in the arguments (also as --reset-account, -reset-account, /reset-account and
+// reset-account=KEY); its own are stripped so the rest (e.g. --environment Production, before or after it) still
+// reach the builder. The command given twice, a bare `--` with it, a missing or invalid key, or any argument the host
+// can't place (a positional one, as the server takes none, or an unknown option containing "reset", so
+// `reset-acount KEY` and `--reset-acount KEY` are refused too) exits 2 before the builder is even created. Blank
+// arguments are ignored.
+string? resetAccountKey = null;
+var isResetCommand = AdminCli.TryTakeResetAccount(args, out var resetKey, out var hostArgs, out var argsError);
+if (argsError is not null)
+{
+    Console.Error.WriteLine(argsError);
+    Console.Error.WriteLine(AdminCli.Usage);
+    Environment.ExitCode = 2;
+    return;
+}
+
+if (isResetCommand)
+{
+    resetAccountKey = resetKey;
+    args = hostArgs;
+}
+
 var builder = WebApplication.CreateBuilder(args);
 var relayToken = builder.Configuration["Relay:Token"] ?? string.Empty;
 var urls = builder.Configuration["Relay:Urls"] ?? "http://127.0.0.1:29417";
@@ -13,6 +36,19 @@ var dbPath = string.IsNullOrWhiteSpace(dbPathConfig)
 var maxMessagesPerMinute = int.TryParse(builder.Configuration["Relay:MaxMessagesPerMinute"], out var mpm)
     ? Math.Clamp(mpm, 10, 10_000)
     : 120;
+
+if (resetAccountKey is not null)
+{
+    Environment.ExitCode = AdminCli.ResetAccount(dbPath, resetAccountKey, Console.Out, Console.Error);
+    return;
+}
+
+if (!RegisterAuthPolicy.TryParseMode(builder.Configuration["Relay:AuthMode"], out var authMode))
+{
+    throw new InvalidOperationException(
+        "Relay:AuthMode must be Off, Bind or Enforce (default Bind).");
+}
+
 builder.WebHost.UseUrls(urls);
 
 var app = builder.Build();
@@ -35,7 +71,7 @@ else if (relayToken is "CHANGE_ME_TO_A_LONG_RANDOM_SECRET")
 }
 
 using var store = new RelayStore(dbPath);
-var sessions = new SessionHub(log, store, maxMessagesPerMinute);
+var sessions = new SessionHub(log, store, maxMessagesPerMinute, authMode);
 
 app.UseWebSockets();
 app.MapGet("/", () => Results.Text("WindUpKey relay. Connect plugins to /ws"));
@@ -56,6 +92,8 @@ app.MapGet("/stats", (HttpContext context) =>
         outboxAcked = stats.OutboxAcked,
         outboxExpired = stats.OutboxExpired,
         eventsLast24h = stats.EventsLast24h,
+        accounts = stats.Accounts,
+        accountsClaimedLast24h = stats.AccountsClaimedLast24h,
     });
 });
 app.Map("/ws", async (HttpContext context) =>
@@ -76,29 +114,36 @@ app.Map("/ws", async (HttpContext context) =>
     await sessions.HandleClientAsync(socket, context.RequestAborted);
 });
 
-log.LogInformation("WindUpKey relay listening on {Urls}; database={Db}", urls, dbPath);
+log.LogInformation("WindUpKey relay listening on {Urls}; database={Db}; authMode={AuthMode}", urls, dbPath, authMode);
 app.Run();
 
 static bool IsAuthorized(HttpContext context, string relayToken)
 {
-    if (string.IsNullOrEmpty(relayToken))
-        return true;
-
-    var provided = context.Request.Query["token"].FirstOrDefault()
-                   ?? context.Request.Headers.Authorization.FirstOrDefault()
-                       ?.Replace("Bearer ", "", StringComparison.OrdinalIgnoreCase);
-    return string.Equals(provided, relayToken, StringComparison.Ordinal);
+    var provided = RelayTokenAuth.GetProvidedToken(
+        context.Request.Query["token"].FirstOrDefault(),
+        context.Request.Headers.Authorization.FirstOrDefault());
+    return RelayTokenAuth.IsAuthorized(provided, relayToken);
 }
 
-internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesPerMinute)
+internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesPerMinute, RelayAuthMode authMode)
 {
     private static readonly TimeSpan WindOutboxTtl = TimeSpan.FromDays(7);
     private static readonly TimeSpan WindRequestCooldown = TimeSpan.FromHours(1);
     private static readonly TimeSpan OwnerOutboxTtl = TimeSpan.FromDays(14);
     private static readonly TimeSpan PairOutboxTtl = TimeSpan.FromDays(30);
+    private static readonly TimeSpan RefusalRecordWindow = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan ReplacedCloseTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan CloseDrainTimeout = TimeSpan.FromSeconds(2);
+
+    /// <summary>Close description when a connection registers a second, different key (relay-only, never an error envelope).</summary>
+    internal const string OneKeyPerConnection = "one_key_per_connection";
 
     private readonly ConcurrentDictionary<string, ClientSession> _byPairingKey =
         new(StringComparer.Ordinal);
+
+    private readonly PerKeyThrottle _refusalRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _keySwitchRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _authFailureRecords = new(RefusalRecordWindow);
 
     public int OnlineCount => _byPairingKey.Count(kv => kv.Value.IsOpen);
 
@@ -124,6 +169,10 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                     json += Encoding.UTF8.GetString(buffer, 0, result.Count);
                 }
 
+                // Once this session has been closed (refused or replaced), ignore whatever the client still sends.
+                if (socket.State != WebSocketState.Open)
+                    break;
+
                 await ProcessMessageAsync(session, json, ct);
             }
         }
@@ -138,7 +187,13 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         finally
         {
             UnregisterSession(session);
-            if (socket.State == WebSocketState.Open)
+            if (socket.State == WebSocketState.CloseSent)
+            {
+                // We closed first (refusal or takeover). Read until the client's close so the socket isn't
+                // disposed with its queued frames unread, which can reset the connection and lose our close.
+                await DrainUntilPeerCloseAsync(socket, ct);
+            }
+            else if (socket.State == WebSocketState.Open)
             {
                 try
                 {
@@ -149,6 +204,26 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                     // ignore
                 }
             }
+        }
+    }
+
+    private static async Task DrainUntilPeerCloseAsync(WebSocket socket, CancellationToken ct)
+    {
+        using var drainCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        drainCts.CancelAfter(CloseDrainTimeout);
+        var buffer = new byte[4 * 1024];
+        try
+        {
+            while (socket.State == WebSocketState.CloseSent)
+            {
+                var result = await socket.ReceiveAsync(buffer, drainCts.Token);
+                if (result.MessageType == WebSocketMessageType.Close)
+                    break;
+            }
+        }
+        catch
+        {
+            // Timed out or the peer is gone; the socket is disposed either way.
         }
     }
 
@@ -259,10 +334,68 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
         }
 
-        if (_byPairingKey.TryGetValue(pairingKey, out var existing)
-            && !ReferenceEquals(existing, session)
-            && existing.IsOpen)
+        // One key per connection: switching characters reconnects, so a second key here is never legitimate.
+        // Checked before the auth decision so it can't claim or probe a second account.
+        if (session.RegisteredKey is { } registeredKey
+            && !string.Equals(registeredKey, pairingKey, StringComparison.Ordinal))
         {
+            if (_keySwitchRecords.TryAcquire(registeredKey))
+            {
+                store.RecordEvent("register_key_switch_refused", pairingKey: registeredKey);
+                log.LogInformation("Register for a second key refused on connection of key={Key}", registeredKey);
+            }
+
+            await session.CloseAsync(WebSocketCloseStatus.PolicyViolation, OneKeyPerConnection, ct);
+            return;
+        }
+
+        var outcome = DecideRegisterAuth(pairingKey, payload?.Secret);
+        if (outcome == RegisterAuthOutcome.RefuseSilently)
+        {
+            // No error envelope: old clients print a wind failure for unknown codes. They also retry every
+            // second or two, so record and log this at most once per key per window.
+            if (_refusalRecords.TryAcquire(pairingKey))
+            {
+                store.RecordEvent("register_refused", pairingKey: pairingKey);
+                log.LogInformation("Register refused (no secret) key={Key}", pairingKey);
+            }
+
+            await session.CloseAsync(WebSocketCloseStatus.PolicyViolation, ErrorCodes.AuthRequired, ct);
+            return;
+        }
+
+        if (outcome == RegisterAuthOutcome.AuthFailed)
+        {
+            // A client with the wrong secret may keep retrying: record and log at most once per key per window.
+            if (_authFailureRecords.TryAcquire(pairingKey))
+            {
+                store.RecordEvent("register_auth_failed", pairingKey: pairingKey);
+                log.LogInformation("Register auth failed key={Key}", pairingKey);
+            }
+
+            await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+            {
+                Code = ErrorCodes.AuthFailed,
+                Message = "relay identity does not match this pairing key",
+            }), ct);
+            await session.CloseAsync(WebSocketCloseStatus.PolicyViolation, ErrorCodes.AuthFailed, ct);
+            return;
+        }
+
+        var authenticated = outcome is RegisterAuthOutcome.Bound or RegisterAuthOutcome.Authenticated;
+
+        // Take the identity before the map points here: a concurrent takeover that displaces this session
+        // strips it afterwards, so a displaced session never keeps acting as this key. Both the set and the
+        // restore are compare-exchanges, so neither can undo a strip that happened in between.
+        var previous = session.Identity;
+        var mine = new SessionIdentity(pairingKey, authenticated);
+        if (!session.TrySwapIdentity(previous, mine))
+            return; // Displaced meanwhile; this session is being closed.
+
+        // Authenticated sessions take over the key from whoever holds it; legacy ones get pair_key_collision.
+        if (!SessionMap.TryClaim(_byPairingKey, pairingKey, session, authenticated, s => s.IsOpen, out var replaced))
+        {
+            session.TrySwapIdentity(mine, previous);
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
                 Code = ErrorCodes.PairKeyCollision,
@@ -271,16 +404,23 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
         }
 
-        if (session.PairingKey is { } oldKey && !string.Equals(oldKey, pairingKey, StringComparison.Ordinal))
+        // Strip the displaced session before anything else (DB writes, logging) so it stops acting as the key.
+        if (replaced is not null)
+            ReplaceSession(replaced, pairingKey);
+
+        session.MarkRegistered(pairingKey);
+        store.RecordEvent("register", pairingKey: pairingKey);
+        if (authMode != RelayAuthMode.Off)
         {
-            if (_byPairingKey.TryGetValue(oldKey, out var cur) && ReferenceEquals(cur, session))
-                _byPairingKey.TryRemove(oldKey, out _);
+            store.RecordEvent(outcome switch
+            {
+                RegisterAuthOutcome.Bound => "register_bound",
+                RegisterAuthOutcome.Authenticated => "register_auth_ok",
+                _ => "register_legacy",
+            }, pairingKey: pairingKey);
         }
 
-        session.PairingKey = pairingKey;
-        _byPairingKey[pairingKey] = session;
-        store.RecordEvent("register", pairingKey: pairingKey);
-        log.LogInformation("Registered key={Key}", pairingKey);
+        log.LogInformation("Registered key={Key} auth={Outcome}", pairingKey, outcome);
 
         var peers = store.GetPeerKeys(pairingKey);
         var consent = store.GetPairConsentForDoll(pairingKey);
@@ -307,6 +447,60 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         await TryCompletePendingForAsync(session, ct);
         await FlushOutboxAsync(session, ct);
+    }
+
+    private RegisterAuthOutcome DecideRegisterAuth(string pairingKey, string? secret)
+    {
+        var outcome = RegisterAuthPolicy.Resolve(
+            authMode,
+            secret,
+            () => store.GetAccountSecretHash(pairingKey),
+            hash => store.TryCreateAccount(pairingKey, hash));
+        if (outcome == RegisterAuthOutcome.Authenticated)
+            store.TouchAccount(pairingKey);
+        return outcome;
+    }
+
+    /// <summary>
+    /// Called after the new session is already mapped. Strips the old session's identity right away, then
+    /// tells it and closes it in the background with a short timeout, so the new session never waits on it.
+    /// </summary>
+    private void ReplaceSession(ClientSession replaced, string pairingKey)
+    {
+        // Old clients print a generic error for unknown codes, so only authenticated (new) clients get the
+        // envelope. Everyone gets the PolicyViolation/session_replaced close.
+        var notify = replaced.Authenticated;
+
+        // Strip identity first so nothing still in flight on the old socket acts as this key.
+        replaced.Identity = null;
+        _ = CloseReplacedSessionAsync(replaced, pairingKey, notify);
+        store.RecordEvent("session_replaced", pairingKey: pairingKey);
+        log.LogInformation("Session replaced key={Key}", pairingKey);
+    }
+
+    private async Task CloseReplacedSessionAsync(ClientSession replaced, string pairingKey, bool notify)
+    {
+        // Relay-originated, so no `to`: that's how clients tell it from a routed error.
+        using var timeout = new CancellationTokenSource(ReplacedCloseTimeout);
+        try
+        {
+            if (notify)
+            {
+                await replaced.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+                {
+                    Code = ErrorCodes.SessionReplaced,
+                    Message = "another session for this pairing key took over",
+                }), timeout.Token);
+            }
+
+            await replaced.CloseAsync(WebSocketCloseStatus.PolicyViolation, ErrorCodes.SessionReplaced, timeout.Token);
+        }
+        catch (Exception ex)
+        {
+            // A stuck or broken old socket is aborted, so its own loop ends too.
+            log.LogDebug(ex, "Closing replaced session failed key={Key}", pairingKey);
+            replaced.Abort();
+        }
     }
 
     private void HandleDollStatePush(ClientSession session, Envelope envelope)
@@ -914,6 +1108,11 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
     private async Task RouteByKeyAsync(Envelope envelope, CancellationToken ct)
     {
+        // Relay-only session codes can't be forged by addressing an error to another key.
+        if (envelope.Type == MessageTypes.Error
+            && ErrorCodes.IsRelayOnly(envelope.GetPayload<ErrorPayload>()?.Code))
+            return;
+
         string? to = envelope.Type switch
         {
             MessageTypes.WindResult => NormalizePairingKey(envelope.GetPayload<WindResultPayload>()?.To),
@@ -958,7 +1157,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         await dest.SendAsync(envelope, ct);
     }
 
-    private static string NormalizePairingKey(string? key)
+    internal static string NormalizePairingKey(string? key)
     {
         if (string.IsNullOrWhiteSpace(key))
             return string.Empty;
@@ -971,8 +1170,39 @@ internal sealed class ClientSession(WebSocket socket)
 {
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
-    public string? PairingKey { get; set; }
+    // Read and written from this session's loop and from other sessions' loops (takeover strips it),
+    // so key and auth flag live in one immutable object that is swapped atomically.
+    private SessionIdentity? _identity;
+    private string? _registeredKey;
+
+    /// <summary>The key this session acts as, or null before register or after it was displaced.</summary>
+    public SessionIdentity? Identity
+    {
+        get => Volatile.Read(ref _identity);
+        set => Volatile.Write(ref _identity, value);
+    }
+
+    public string? PairingKey => Identity?.PairingKey;
+
+    /// <summary>True when the last register proved ownership of <see cref="PairingKey"/> with its secret.</summary>
+    public bool Authenticated => Identity?.Authenticated ?? false;
+
+    /// <summary>
+    /// The first key this connection registered successfully. A connection acts as one key only, so it never
+    /// changes once set, even after the session is displaced.
+    /// </summary>
+    public string? RegisteredKey => Volatile.Read(ref _registeredKey);
+
+    /// <summary>Sets <see cref="Identity"/> to <paramref name="value"/> only while it is still <paramref name="expected"/>.</summary>
+    public bool TrySwapIdentity(SessionIdentity? expected, SessionIdentity? value) =>
+        ReferenceEquals(Interlocked.CompareExchange(ref _identity, value, expected), expected);
+
+    public void MarkRegistered(string pairingKey) => Interlocked.CompareExchange(ref _registeredKey, pairingKey, null);
+
     public bool IsOpen => socket.State == WebSocketState.Open;
+
+    /// <summary>Drops the connection without a close handshake (for a socket that is stuck).</summary>
+    public void Abort() => socket.Abort();
 
     public async Task SendAsync(Envelope envelope, CancellationToken ct)
     {
@@ -989,4 +1219,31 @@ internal sealed class ClientSession(WebSocket socket)
             _sendLock.Release();
         }
     }
+
+    /// <summary>
+    /// Sends a close frame without waiting for the peer's reply, so it is safe while this
+    /// session's own loop is blocked in ReceiveAsync. Once the socket has left Open, that loop
+    /// stops processing frames and drains until the peer's close (bounded) before disposing.
+    /// </summary>
+    public async Task CloseAsync(WebSocketCloseStatus status, string description, CancellationToken ct)
+    {
+        await _sendLock.WaitAsync(ct);
+        try
+        {
+            if (socket.State != WebSocketState.Open)
+                return;
+            await socket.CloseOutputAsync(status, description, ct);
+        }
+        catch (WebSocketException)
+        {
+            // Peer already gone.
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
 }
+
+/// <summary>Who a session acts as. Immutable, so a session's key and auth flag always change together.</summary>
+internal sealed record SessionIdentity(string PairingKey, bool Authenticated);
