@@ -13,7 +13,7 @@ namespace WindUpRelay.Tests;
 /// Drives <see cref="SessionHub"/> over real loopback WebSockets (no web host), so register, takeover,
 /// routing and close behaviour are tested end to end against the relay's own code.
 /// </summary>
-public sealed class SessionHubTests : IDisposable
+public sealed partial class SessionHubTests : IDisposable
 {
     private const string Key = "KEYAAAA1";
     private const string Peer = "PEERBBB2";
@@ -49,12 +49,22 @@ public sealed class SessionHubTests : IDisposable
         }
     }
 
-    private SessionHub NewHub(string mode) =>
-        new(NullLogger.Instance, _store, 1000, Enum.Parse<RelayAuthMode>(mode));
+    private SessionHub NewHub(string mode, TimeSpan? sendTimeout = null) =>
+        new(NullLogger.Instance, _store, 1000, Enum.Parse<RelayAuthMode>(mode))
+        {
+            SendTimeout = sendTimeout ?? SessionHub.DefaultSendTimeout,
+        };
 
-    private async Task<TestClient> ConnectAsync(SessionHub hub, bool reading = true)
+    /// <summary>
+    /// <paramref name="requestAborted"/> stands in for this connection's own <c>RequestAborted</c> (all connections
+    /// share the fixture's token otherwise).
+    /// </summary>
+    private async Task<TestClient> ConnectAsync(SessionHub hub, bool reading = true, CancellationToken? requestAborted = null)
     {
-        var client = await TestClient.ConnectAsync(hub, reading, _cts.Token);
+        var ct = requestAborted is { } own
+            ? CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, own).Token
+            : _cts.Token;
+        var client = await TestClient.ConnectAsync(hub, reading, ct);
         _clients.Add(client);
         return client;
     }
@@ -66,6 +76,9 @@ public sealed class SessionHubTests : IDisposable
         await client.ExpectTypeAsync(MessageTypes.PairSync);
         return client;
     }
+
+    /// <summary>An established pair, as after both partners submitted each other's key.</summary>
+    private void Pair(string a, string b) => Assert.True(_store.TryEstablishPair(a, b));
 
     private long CountEvents(string kind)
     {
@@ -84,6 +97,7 @@ public sealed class SessionHubTests : IDisposable
         var secret = RelaySecret.Generate();
         var old = await RegisterOkAsync(hub, Key, secret);
         var peer = await RegisterOkAsync(hub, Peer, null);
+        Pair(Key, Peer);
 
         var replacement = await RegisterOkAsync(hub, Key, secret);
 
@@ -127,6 +141,7 @@ public sealed class SessionHubTests : IDisposable
         var stuck = await ConnectAsync(hub, reading: false);
         await stuck.RegisterAsync(Key, secret);
         var peer = await RegisterOkAsync(hub, Peer, null);
+        Pair(Key, Peer);
         await Task.Delay(200);
 
         // Route enough traffic at the stuck session that the relay's send to it blocks (holding its send lock).
@@ -153,6 +168,7 @@ public sealed class SessionHubTests : IDisposable
         var stuck = await ConnectAsync(hub, reading: false);
         await stuck.RegisterAsync(Key, secret);
         var peer = await RegisterOkAsync(hub, Peer, null);
+        Pair(Key, Peer);
         await Task.Delay(200);
 
         // Block the relay's sends to the old session, so its close is stuck and its socket stays open for a while.
@@ -262,6 +278,7 @@ public sealed class SessionHubTests : IDisposable
         var hub = NewHub(mode);
         var target = await RegisterOkAsync(hub, Key, null);
         var sender = await RegisterOkAsync(hub, Peer, null);
+        Pair(Key, Peer);
 
         foreach (var code in new[]
                  {
@@ -406,12 +423,17 @@ public sealed class SessionHubTests : IDisposable
         private readonly TcpClient _tcp;
         private readonly TcpClient _serverTcp;
         private readonly WebSocket _socket;
+        private readonly WebSocket _serverSocket;
+        private readonly BreakableStream _serverStream;
         private readonly Channel<Received> _inbox = Channel.CreateUnbounded<Received>();
 
-        private TestClient(TcpClient tcp, TcpClient serverTcp, WebSocket socket, Task serverTask, bool reading)
+        private TestClient(
+            TcpClient tcp, TcpClient serverTcp, BreakableStream serverStream, WebSocket serverSocket, WebSocket socket, Task serverTask, bool reading)
         {
             _tcp = tcp;
             _serverTcp = serverTcp;
+            _serverStream = serverStream;
+            _serverSocket = serverSocket;
             _socket = socket;
             ServerTask = serverTask;
             if (reading)
@@ -422,6 +444,19 @@ public sealed class SessionHubTests : IDisposable
         public Task ServerTask { get; }
 
         public bool IsOpen => _socket.State == WebSocketState.Open;
+
+        /// <summary>
+        /// The relay's next <paramref name="count"/> writes to this client fail (after letting <paramref name="skip"/>
+        /// through), as when the client's connection dies mid-send. Reads keep working, so the relay still sees the
+        /// socket as open and this client as registered.
+        /// </summary>
+        public void BreakRelayWrites(int count = int.MaxValue, int skip = 0) => _serverStream.Break(count, skip);
+
+        /// <summary>Aborts the relay's side of this connection, as the relay does to a stuck replaced session.</summary>
+        public void AbortRelaySide() => _serverSocket.Abort();
+
+        /// <summary>Starts reading a client created with <c>reading: false</c>.</summary>
+        public void StartReading() => _ = PumpAsync();
 
         /// <summary>
         /// <paramref name="reading"/> false never reads from the socket, with small buffers on both ends,
@@ -443,10 +478,11 @@ public sealed class SessionHubTests : IDisposable
                 if (!reading)
                     serverTcp.SendBufferSize = 4 * 1024;
 
-                var serverSocket = WebSocket.CreateFromStream(serverTcp.GetStream(), new WebSocketCreationOptions { IsServer = true });
+                var serverStream = new BreakableStream(serverTcp.GetStream());
+                var serverSocket = WebSocket.CreateFromStream(serverStream, new WebSocketCreationOptions { IsServer = true });
                 var clientSocket = WebSocket.CreateFromStream(tcp.GetStream(), new WebSocketCreationOptions { IsServer = false });
                 var serverTask = Task.Run(() => hub.HandleClientAsync(serverSocket, ct), ct);
-                return new TestClient(tcp, serverTcp, clientSocket, serverTask, reading);
+                return new TestClient(tcp, serverTcp, serverStream, serverSocket, clientSocket, serverTask, reading);
             }
             finally
             {
@@ -460,6 +496,13 @@ public sealed class SessionHubTests : IDisposable
         public async Task SendAsync(string type, object payload)
         {
             var bytes = Encoding.UTF8.GetBytes(Envelope.Create(type, payload).Serialize());
+            await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+
+        /// <summary>Sends <paramref name="json"/> as one text frame, as is (for payloads a well-behaved client never sends).</summary>
+        public async Task SendRawAsync(string json)
+        {
+            var bytes = Encoding.UTF8.GetBytes(json);
             await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
@@ -487,9 +530,10 @@ public sealed class SessionHubTests : IDisposable
             }
         }
 
-        public async Task<Envelope> ExpectTypeAsync(string type)
+        /// <summary>The next envelope of <paramref name="type"/>, within <paramref name="wait"/> (default <see cref="Wait"/>).</summary>
+        public async Task<Envelope> ExpectTypeAsync(string type, TimeSpan? wait = null)
         {
-            var deadline = DateTime.UtcNow + Wait;
+            var deadline = DateTime.UtcNow + (wait ?? Wait);
             while (DateTime.UtcNow < deadline)
             {
                 var next = await NextAsync(deadline - DateTime.UtcNow);
@@ -560,6 +604,67 @@ public sealed class SessionHubTests : IDisposable
             _socket.Dispose();
             _tcp.Dispose();
             _serverTcp.Dispose();
+        }
+    }
+
+    /// <summary>The relay's side of a test connection, whose writes can be made to fail (before any byte is written).</summary>
+    private sealed class BreakableStream(Stream inner) : Stream
+    {
+        private int _skip;
+        private int _fail;
+
+        public void Break(int count, int skip)
+        {
+            Volatile.Write(ref _skip, skip);
+            Volatile.Write(ref _fail, count);
+        }
+
+        private void ThrowIfBroken()
+        {
+            if (Volatile.Read(ref _fail) <= 0)
+                return;
+            if (Interlocked.Decrement(ref _skip) >= 0)
+                return;
+            Interlocked.Decrement(ref _fail);
+            throw new IOException("connection reset (test)");
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => inner.Flush();
+        public override Task FlushAsync(CancellationToken ct) => inner.FlushAsync(ct);
+        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) => inner.ReadAsync(buffer, ct);
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => inner.ReadAsync(buffer, offset, count, ct);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            ThrowIfBroken();
+            inner.Write(buffer, offset, count);
+        }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            ThrowIfBroken();
+            return inner.WriteAsync(buffer, ct);
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+        {
+            ThrowIfBroken();
+            return inner.WriteAsync(buffer, offset, count, ct);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                inner.Dispose();
+            base.Dispose(disposing);
         }
     }
 }

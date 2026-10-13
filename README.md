@@ -120,3 +120,47 @@ the relay prints usage and exits with code `2` instead of starting.
 
 Run `reset-account` only right before the affected user reconnects. Once a key is reset,
 anyone with the shared token can claim it again, so the first register with a secret wins.
+
+## Routing between partners
+
+The relay only carries messages between keys with an established pair (or from a key to itself,
+which the plugin's debug self-pair uses):
+
+* `wind`, `unwind`, `windRequest`, `ownerSettingsQuery`, `ownerSettingsUpdate`, `ownerGrant` and
+  `call` to a key that isn't a partner are neither forwarded nor queued. The sender gets a generic
+  `not_allowed` error for the request (`ownerGrant`, which has no request ID, is dropped silently).
+  `pairRemove` is always delivered live, so a pair that only one side still has heals. For an offline
+  key, it's queued only when it actually removed a pair or that key's own pending pair request (not
+  the sender's), and only if one from the same sender isn't already waiting. `ownerRevoked` is
+  delivered or queued only while the two keys are paired (the plugin sends it just before its
+  `pairRemove`), and otherwise dropped silently; at most one per sender waits for an offline key.
+* Replies (`presenceResult`, `windResult`, `ownerSettingsResult`, `ownerSettingsAck`, `callAck`,
+  `callResult` and routed `error`s) get `from` set to the sender's own key, and are dropped unless
+  the two keys are paired.
+* A `presenceQuery` for a key that isn't a partner gets the same answer as an offline key, and isn't
+  forwarded.
+* Queued messages are checked again when they're delivered: if the pair is gone, they're expired
+  (`outbox_drop_unpaired`). Removing a pair also deletes the still-pending messages between the two
+  keys, except `pairRemove` and `ownerRevoked` notices, which are still delivered. A recipient whose connection fails during a
+  send, or that doesn't take a message within 5 seconds, counts as offline (`send_failed`): the
+  message is queued if its type is queued, and a queued one stays pending until it was actually sent.
+  A connection that doesn't take a message within 5 seconds, including the relay's own replies to
+  it, is dropped, so it can't hold up its partners again and again.
+* `dollStatePush` consent rows are kept only for partners (`pair_consent_unpaired` otherwise), and
+  consent or wind stamps more than 5 minutes ahead of the relay's clock are rejected
+  (`future_stamp_rejected`, recorded at most once per key every 5 minutes). On every start, the relay
+  deletes stored consent and wind rows stamped more than 5 minutes in the future, and logs how many.
+  The doll's plugin then pushes its real state again.
+* The `pairSync` sent on register lists only established pairs, with consent rows only for them. A
+  consent row without a pair doesn't make a partner.
+* A message whose payload can't be read (wrong JSON types) is dropped (`payload_malformed`, recorded
+  at most once per key every 5 minutes). The sender's connection stays open.
+
+The plugin re-submits its partners on every connect, so pairs rebuild themselves. A fresh relay host
+(for example a standby with an empty database) carries winds and other messages between two partners
+only after both of them have connected to it once. Nobody needs to pair again.
+
+**Rollout order:** deploy this relay on every host before shipping the plugin release that goes with
+it, as for relay identity above. The protection against forged replies (`from`) and against
+messages between keys that aren't paired lives in the relay: a new plugin on an old relay still
+works, but isn't protected.

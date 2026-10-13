@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using WindUpKey.Protocol;
 
 /// <summary>
 /// SQLite persistence for durable pairs, doll consent, wind expiry, pending submits,
@@ -319,34 +320,47 @@ internal sealed class RelayStore : IDisposable
         }
     }
 
-    public void RemovePair(string a, string b)
+    /// <summary>
+    /// Removes the pair, its pending submits and consent, and the still-pending outbox rows between the two keys in
+    /// both directions, except <c>pairRemove</c> and <c>ownerRevoked</c> notices. <paramref name="a"/> is the key
+    /// asking for the removal. Says whether it removed something <paramref name="b"/> had: an established pair, or
+    /// <paramref name="b"/>'s pending submit toward <paramref name="a"/> (<paramref name="a"/>'s own submit doesn't
+    /// count, so submitting and removing in a loop can't queue notices to a stranger), and how many outbox rows were
+    /// purged.
+    /// </summary>
+    public PairRemoval RemovePair(string a, string b)
     {
         Canonical(a, b, out var lo, out var hi);
         lock (_gate)
         {
             using var conn = Open();
             using var tx = conn.BeginTransaction();
+            int removed;
             using (var del = conn.CreateCommand())
             {
                 del.Transaction = tx;
                 del.CommandText = "DELETE FROM pairs WHERE key_lo = $lo AND key_hi = $hi;";
                 del.Parameters.AddWithValue("$lo", lo);
                 del.Parameters.AddWithValue("$hi", hi);
-                del.ExecuteNonQuery();
+                removed = del.ExecuteNonQuery();
             }
 
-            using (var clear = conn.CreateCommand())
+            using (var clearPeers = conn.CreateCommand())
             {
-                clear.Transaction = tx;
-                clear.CommandText =
-                    """
-                    DELETE FROM pair_submits
-                    WHERE (my_key = $a AND their_key = $b)
-                       OR (my_key = $b AND their_key = $a);
-                    """;
-                clear.Parameters.AddWithValue("$a", a);
-                clear.Parameters.AddWithValue("$b", b);
-                clear.ExecuteNonQuery();
+                clearPeers.Transaction = tx;
+                clearPeers.CommandText = "DELETE FROM pair_submits WHERE my_key = $b AND their_key = $a;";
+                clearPeers.Parameters.AddWithValue("$a", a);
+                clearPeers.Parameters.AddWithValue("$b", b);
+                removed += clearPeers.ExecuteNonQuery();
+            }
+
+            using (var clearOwn = conn.CreateCommand())
+            {
+                clearOwn.Transaction = tx;
+                clearOwn.CommandText = "DELETE FROM pair_submits WHERE my_key = $a AND their_key = $b;";
+                clearOwn.Parameters.AddWithValue("$a", a);
+                clearOwn.Parameters.AddWithValue("$b", b);
+                clearOwn.ExecuteNonQuery();
             }
 
             using (var consent = conn.CreateCommand())
@@ -363,7 +377,26 @@ internal sealed class RelayStore : IDisposable
                 consent.ExecuteNonQuery();
             }
 
+            int purged;
+            using (var outbox = conn.CreateCommand())
+            {
+                outbox.Transaction = tx;
+                outbox.CommandText =
+                    """
+                    DELETE FROM outbox
+                    WHERE status = 'pending'
+                      AND msg_type NOT IN ($pairRemove, $ownerRevoked)
+                      AND ((from_key = $a AND to_key = $b) OR (from_key = $b AND to_key = $a));
+                    """;
+                outbox.Parameters.AddWithValue("$a", a);
+                outbox.Parameters.AddWithValue("$b", b);
+                outbox.Parameters.AddWithValue("$pairRemove", MessageTypes.PairRemove);
+                outbox.Parameters.AddWithValue("$ownerRevoked", MessageTypes.OwnerRevoked);
+                purged = outbox.ExecuteNonQuery();
+            }
+
             tx.Commit();
+            return new PairRemoval(removed > 0, purged);
         }
     }
 
@@ -586,28 +619,101 @@ internal sealed class RelayStore : IDisposable
         lock (_gate)
         {
             using var conn = Open();
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText =
-                """
-                INSERT INTO outbox
-                  (request_id, to_key, from_key, msg_type, envelope_json, created_utc, expires_utc, status)
-                VALUES
-                  ($rid, $to, $from, $type, $json, $now, $exp, 'pending');
-                """;
-            cmd.Parameters.AddWithValue("$rid", (object?)requestId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$to", toKey);
-            cmd.Parameters.AddWithValue("$from", fromKey);
-            cmd.Parameters.AddWithValue("$type", msgType);
-            cmd.Parameters.AddWithValue("$json", envelopeJson);
-            var now = DateTimeOffset.UtcNow;
-            cmd.Parameters.AddWithValue("$now", now.ToString("O"));
-            cmd.Parameters.AddWithValue("$exp", now.Add(ttl).ToString("O"));
-            cmd.ExecuteNonQuery();
-
-            using var idCmd = conn.CreateCommand();
-            idCmd.CommandText = "SELECT last_insert_rowid();";
-            return (long)(idCmd.ExecuteScalar() ?? 0L);
+            return InsertOutbox(conn, null, requestId, fromKey, toKey, msgType, envelopeJson, ttl);
         }
+    }
+
+    /// <summary>
+    /// Like <see cref="EnqueueOutbox"/>, unless a row of <paramref name="msgType"/> from <paramref name="fromKey"/> to
+    /// <paramref name="toKey"/> is still pending (and unexpired). Returns the new row's id, or null when one was.
+    /// First, in the same transaction, deletes the pending rows of <paramref name="supersedes"/> from
+    /// <paramref name="fromKey"/> to <paramref name="toKey"/>, even when nothing new is queued: an
+    /// <c>ownerRevoked</c> drops the <c>ownerGrant</c> rows queued before it, so the one-copy rule can't deliver a grant
+    /// after a later revoke (02-D31).
+    /// </summary>
+    public long? EnqueueOutboxOnce(
+        string? requestId,
+        string fromKey,
+        string toKey,
+        string msgType,
+        string envelopeJson,
+        TimeSpan ttl,
+        string? supersedes = null)
+    {
+        lock (_gate)
+        {
+            ExpireLocked();
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            if (supersedes is not null)
+            {
+                using var del = conn.CreateCommand();
+                del.Transaction = tx;
+                del.CommandText =
+                    """
+                    DELETE FROM outbox
+                    WHERE from_key = $from AND to_key = $to AND msg_type = $type AND status = 'pending';
+                    """;
+                del.Parameters.AddWithValue("$from", fromKey);
+                del.Parameters.AddWithValue("$to", toKey);
+                del.Parameters.AddWithValue("$type", supersedes);
+                del.ExecuteNonQuery();
+            }
+
+            long? id = null;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText =
+                    """
+                    SELECT COUNT(*) FROM outbox
+                    WHERE from_key = $from AND to_key = $to AND msg_type = $type AND status = 'pending';
+                    """;
+                cmd.Parameters.AddWithValue("$from", fromKey);
+                cmd.Parameters.AddWithValue("$to", toKey);
+                cmd.Parameters.AddWithValue("$type", msgType);
+                if ((long)(cmd.ExecuteScalar() ?? 0L) == 0)
+                    id = InsertOutbox(conn, tx, requestId, fromKey, toKey, msgType, envelopeJson, ttl);
+            }
+
+            tx.Commit();
+            return id;
+        }
+    }
+
+    private static long InsertOutbox(
+        SqliteConnection conn,
+        SqliteTransaction? tx,
+        string? requestId,
+        string fromKey,
+        string toKey,
+        string msgType,
+        string envelopeJson,
+        TimeSpan ttl)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText =
+            """
+            INSERT INTO outbox
+              (request_id, to_key, from_key, msg_type, envelope_json, created_utc, expires_utc, status)
+            VALUES
+              ($rid, $to, $from, $type, $json, $now, $exp, 'pending');
+            """;
+        cmd.Parameters.AddWithValue("$rid", (object?)requestId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$to", toKey);
+        cmd.Parameters.AddWithValue("$from", fromKey);
+        cmd.Parameters.AddWithValue("$type", msgType);
+        cmd.Parameters.AddWithValue("$json", envelopeJson);
+        var now = DateTimeOffset.UtcNow;
+        cmd.Parameters.AddWithValue("$now", now.ToString("O"));
+        cmd.Parameters.AddWithValue("$exp", now.Add(ttl).ToString("O"));
+        cmd.ExecuteNonQuery();
+
+        using var idCmd = conn.CreateCommand();
+        idCmd.Transaction = tx;
+        idCmd.CommandText = "SELECT last_insert_rowid();";
+        return (long)(idCmd.ExecuteScalar() ?? 0L);
     }
 
     public IReadOnlyList<OutboxRow> TakePendingFor(string toKey, int limit = 50)
@@ -661,7 +767,26 @@ internal sealed class RelayStore : IDisposable
         }
     }
 
-    public void MarkAckedByRequestId(string requestId)
+    /// <summary>
+    /// Expires a pending row that may no longer be delivered (its pair is gone). Returns false when it wasn't pending.
+    /// </summary>
+    public bool MarkExpired(long id)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE outbox SET status = 'expired' WHERE id = $id AND status = 'pending';";
+            cmd.Parameters.AddWithValue("$id", id);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+    }
+
+    /// <summary>
+    /// Acks the rows for <paramref name="requestId"/> that were sent to <paramref name="ackerKey"/> (the session
+    /// replying) by <paramref name="senderKey"/> (the reply's <c>to</c>), so nobody else can ack them.
+    /// </summary>
+    public void MarkAckedByRequestId(string requestId, string ackerKey, string senderKey)
     {
         if (string.IsNullOrWhiteSpace(requestId))
             return;
@@ -674,9 +799,12 @@ internal sealed class RelayStore : IDisposable
                 """
                 UPDATE outbox
                 SET status = 'acked', acked_utc = $utc
-                WHERE request_id = $rid AND status IN ('pending', 'delivered');
+                WHERE request_id = $rid AND to_key = $acker AND from_key = $sender
+                  AND status IN ('pending', 'delivered');
                 """;
             cmd.Parameters.AddWithValue("$rid", requestId);
+            cmd.Parameters.AddWithValue("$acker", ackerKey);
+            cmd.Parameters.AddWithValue("$sender", senderKey);
             cmd.Parameters.AddWithValue("$utc", UtcNow());
             cmd.ExecuteNonQuery();
         }
@@ -776,7 +904,7 @@ internal sealed class RelayStore : IDisposable
                     "SELECT last_request_utc FROM wind_request_cooldowns WHERE pairing_key = $key;";
                 select.Parameters.AddWithValue("$key", pairingKey);
                 if (select.ExecuteScalar() is string raw
-                    && DateTimeOffset.TryParse(raw, out var parsed))
+                    && TryParseUtc(raw, out var parsed))
                 {
                     lastRequest = parsed;
                 }
@@ -805,6 +933,57 @@ internal sealed class RelayStore : IDisposable
 
             tx.Commit();
             return true;
+        }
+    }
+
+    /// <summary>
+    /// One-time startup cleanup: deletes every stored consent and wind row whose <c>updated_utc</c> is more than
+    /// <see cref="SyncStamp.MaxFutureSkew"/> after <paramref name="now"/>, so a forged far-future stamp stops winning
+    /// last-write-wins. The doll's client then finds no relay row and pushes its real state again. Rows within the
+    /// window are left alone, so it is idempotent and safe on every start. Returns how many rows were deleted.
+    /// </summary>
+    public int DeleteFutureSyncStamps(DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var tx = conn.BeginTransaction();
+            var count = 0;
+            foreach (var (table, keyColumns) in new[]
+                     {
+                         ("pair_consent", new[] { "doll_key", "peer_key" }),
+                         ("doll_wind", new[] { "pairing_key" }),
+                     })
+            {
+                var future = new List<object[]>();
+                using (var sel = conn.CreateCommand())
+                {
+                    sel.Transaction = tx;
+                    sel.CommandText = $"SELECT {string.Join(", ", keyColumns)}, updated_utc FROM {table};";
+                    using var reader = sel.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        var raw = reader.GetString(keyColumns.Length);
+                        if (TryParseUtc(raw, out var stamp) && SyncStamp.IsTooFarAhead(stamp, now))
+                            future.Add(Enumerable.Range(0, keyColumns.Length).Select(i => (object)reader.GetString(i)).ToArray());
+                    }
+                }
+
+                foreach (var keys in future)
+                {
+                    using var del = conn.CreateCommand();
+                    del.Transaction = tx;
+                    del.CommandText =
+                        $"DELETE FROM {table} WHERE " +
+                        string.Join(" AND ", keyColumns.Select((c, i) => $"{c} = $k{i}")) + ";";
+                    for (var i = 0; i < keys.Length; i++)
+                        del.Parameters.AddWithValue("$k" + i, keys[i]);
+                    count += del.ExecuteNonQuery();
+                }
+            }
+
+            tx.Commit();
+            return count;
         }
     }
 
@@ -885,8 +1064,11 @@ internal sealed class RelayStore : IDisposable
     private static string UtcNow() => DateTimeOffset.UtcNow.ToString("O");
 
     private static bool TryParseUtc(string raw, out DateTimeOffset value)
-        => DateTimeOffset.TryParse(raw, out value);
+        => SyncStamp.TryParse(raw, out value);
 }
+
+/// <summary>What <see cref="RelayStore.RemovePair"/> did: whether a pair or pending submit existed, and how many outbox rows went.</summary>
+internal readonly record struct PairRemoval(bool Removed, int Purged);
 
 internal readonly record struct OutboxRow(
     long Id,

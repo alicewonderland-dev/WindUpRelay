@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using WindUpKey.Protocol;
 
 namespace WindUpRelay.Tests;
 
@@ -204,5 +205,32 @@ public class SessionRulesTests
         Assert.True(throttle.TryAcquire("NEW3"));
         Assert.False(throttle.TryAcquire("NEW3"));
         Assert.Equal(2, throttle.TrackedKeys);
+    }
+}
+
+public sealed class RoutingRulesTests
+{
+    [Theory]
+    [InlineData(MessageTypes.Wind)]
+    [InlineData(MessageTypes.WindRequest)]
+    [InlineData(MessageTypes.Unwind)]
+    [InlineData(MessageTypes.OwnerSettingsQuery)]
+    [InlineData(MessageTypes.OwnerSettingsUpdate)]
+    [InlineData(MessageTypes.OwnerGrant)]
+    [InlineData(MessageTypes.Call)]
+    public void Forwards_RequireAPair(string type) => Assert.True(RoutingRules.RequiresPair(type));
+
+    [Theory]
+    [InlineData(MessageTypes.OwnerRevoked)]
+    [InlineData(MessageTypes.PairRemove)]
+    [InlineData(MessageTypes.PairEstablished)]
+    public void RemovalNotices_AndPairing_DoNot(string type) => Assert.False(RoutingRules.RequiresPair(type));
+
+    [Fact]
+    public void MayRoute_ToOneself_WithoutAskingForAPair()
+    {
+        Assert.True(RoutingRules.MayRoute("AAAA1111", "AAAA1111", () => throw new InvalidOperationException()));
+        Assert.True(RoutingRules.MayRoute("AAAA1111", "BBBB2222", () => true));
+        Assert.False(RoutingRules.MayRoute("AAAA1111", "BBBB2222", () => false));
     }
 }

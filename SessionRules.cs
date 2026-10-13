@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using WindUpKey.Protocol;
 
 /// <summary>Session-map rules for register, kept free of sockets so they can be tested directly.</summary>
 internal static class SessionMap
@@ -130,4 +131,26 @@ internal sealed class PerKeyThrottle(TimeSpan window, TimeProvider? timeProvider
                 ((ICollection<KeyValuePair<string, DateTimeOffset>>)_lastByKey).Remove(entry);
         }
     }
+}
+
+/// <summary>Which routed messages need an established pair, kept free of sockets so they can be tested directly.</summary>
+internal static class RoutingRules
+{
+    /// <summary>
+    /// Messages forwarded (or queued) only between keys with an established pair, or to oneself. Also re-checked when
+    /// a queued one is delivered. <c>pairRemove</c> only removes state, so it stays unconditional and half-pairs heal.
+    /// <c>ownerRevoked</c> is delivered or queued only between paired keys (02-D28), but a queued one isn't re-checked:
+    /// the client's pairRemove right after it removes the pair before it's delivered.
+    /// </summary>
+    public static bool RequiresPair(string msgType) => msgType is
+        MessageTypes.Wind or MessageTypes.WindRequest or MessageTypes.Unwind
+        or MessageTypes.OwnerSettingsQuery or MessageTypes.OwnerSettingsUpdate or MessageTypes.OwnerGrant
+        or MessageTypes.Call;
+
+    /// <summary>
+    /// Whether <paramref name="fromKey"/> may address <paramref name="toKey"/>: a message to oneself (the debug
+    /// self-pair) always may; otherwise only with an established pair. <paramref name="hasPair"/> is asked only then.
+    /// </summary>
+    public static bool MayRoute(string fromKey, string toKey, Func<bool> hasPair) =>
+        string.Equals(fromKey, toKey, StringComparison.Ordinal) || hasPair();
 }

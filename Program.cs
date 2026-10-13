@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json;
 using WindUpKey.Protocol;
 
 // Admin CLI: `reset-account <PAIRINGKEY>` uses the server's configuration but never starts the host.
@@ -71,6 +73,13 @@ else if (relayToken is "CHANGE_ME_TO_A_LONG_RANDOM_SECRET")
 }
 
 using var store = new RelayStore(dbPath);
+
+// A consent or wind stamp far in the future would win last-write-wins until then. Pushes like that are rejected
+// now; this deletes any stored before, and the doll's client re-pushes its real state when it finds no relay row.
+// Rows within the allowed skew are untouched, so it runs on every start. Only the count is logged.
+var deletedStamps = store.DeleteFutureSyncStamps(DateTimeOffset.UtcNow);
+log.LogInformation("Startup cleanup: {Count} future-stamped consent/wind row(s) deleted", deletedStamps);
+
 var sessions = new SessionHub(log, store, maxMessagesPerMinute, authMode);
 
 app.UseWebSockets();
@@ -134,6 +143,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     private static readonly TimeSpan RefusalRecordWindow = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan ReplacedCloseTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan CloseDrainTimeout = TimeSpan.FromSeconds(2);
+    internal static readonly TimeSpan DefaultSendTimeout = TimeSpan.FromSeconds(5);
 
     /// <summary>Close description when a connection registers a second, different key (relay-only, never an error envelope).</summary>
     internal const string OneKeyPerConnection = "one_key_per_connection";
@@ -141,15 +151,25 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     private readonly ConcurrentDictionary<string, ClientSession> _byPairingKey =
         new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// How long any send to a session may take: from another session (a recipient that stops reading counts as
+    /// offline after it, instead of stalling the sender's loop) or on its own loop (pong, pairSync, flush, replies).
+    /// A session that doesn't take a frame in time is aborted. Settable for tests.
+    /// </summary>
+    internal TimeSpan SendTimeout { get; init; } = DefaultSendTimeout;
+
     private readonly PerKeyThrottle _refusalRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _keySwitchRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _authFailureRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _notPairedRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _futureStampRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _malformedRecords = new(RefusalRecordWindow);
 
     public int OnlineCount => _byPairingKey.Count(kv => kv.Value.IsOpen);
 
     public async Task HandleClientAsync(WebSocket socket, CancellationToken ct)
     {
-        var session = new ClientSession(socket);
+        var session = new ClientSession(socket, SendTimeout);
         try
         {
             var buffer = new byte[16 * 1024];
@@ -257,6 +277,29 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
         }
 
+        try
+        {
+            await DispatchAsync(session, envelope, ct);
+        }
+        catch (JsonException) when (envelope.Type != MessageTypes.Register)
+        {
+            // A payload that doesn't deserialise (bad JSON types) is this message's problem, not the session's.
+            RecordMalformed(session, envelope.Type);
+        }
+    }
+
+    /// <summary>A client sending broken payloads may do so on every message: record and log at most once per key per window.</summary>
+    private void RecordMalformed(ClientSession session, string msgType)
+    {
+        var key = session.PairingKey;
+        if (!_malformedRecords.TryAcquire(key ?? string.Empty))
+            return;
+        store.RecordEvent("payload_malformed", pairingKey: key, msgType: msgType);
+        log.LogInformation("Dropped a {Type} with an unreadable payload key={Key}", msgType, key);
+    }
+
+    private async Task DispatchAsync(ClientSession session, Envelope envelope, CancellationToken ct)
+    {
         switch (envelope.Type)
         {
             case MessageTypes.Register:
@@ -308,7 +351,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             case MessageTypes.CallAck:
             case MessageTypes.CallResult:
             case MessageTypes.Error:
-                await RouteByKeyAsync(envelope, ct);
+                await RouteReplyAsync(session, envelope, ct);
                 break;
             case MessageTypes.Ping:
                 await session.SendAsync(Envelope.Create(MessageTypes.Pong, new { }), ct);
@@ -422,12 +465,11 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         log.LogInformation("Registered key={Key} auth={Outcome}", pairingKey, outcome);
 
-        var peers = store.GetPeerKeys(pairingKey);
-        var consent = store.GetPairConsentForDoll(pairingKey);
+        // Only established pairs, and consent only toward them: a consent row alone never makes a partner.
+        var peerKeys = store.GetPeerKeys(pairingKey).ToList();
+        var paired = peerKeys.ToHashSet(StringComparer.Ordinal);
+        var consent = store.GetPairConsentForDoll(pairingKey).Where(c => paired.Contains(c.PeerKey)).ToList();
         var wind = store.GetDollWind(pairingKey);
-        var peerKeys = peers.Count > 0
-            ? peers.ToList()
-            : consent.Select(c => c.PeerKey).Distinct(StringComparer.Ordinal).OrderBy(k => k).ToList();
 
         await session.SendAsync(Envelope.Create(MessageTypes.PairSync, new PairSyncPayload
         {
@@ -512,10 +554,16 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (payload is null)
             return;
 
+        // Legacy (unauthenticated) sessions still push during rollout, under the same rules.
+        var now = DateTimeOffset.UtcNow;
         if (!string.IsNullOrEmpty(payload.WindUpdatedUtc))
         {
             string? expiryUtc = payload.ClearWind ? null : payload.ExpiryUtc;
-            if (store.TryMergeDollWind(dollKey, expiryUtc, payload.WindUpdatedUtc))
+            if (IsTooFarAhead(payload.WindUpdatedUtc, now))
+            {
+                RecordFutureStamp(dollKey, "wind");
+            }
+            else if (store.TryMergeDollWind(dollKey, expiryUtc, payload.WindUpdatedUtc))
             {
                 store.RecordEvent(
                     "doll_wind_merge",
@@ -528,11 +576,25 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (payload.Peers is null || payload.Peers.Count == 0)
             return;
 
+        var unpaired = 0;
         foreach (var peer in payload.Peers)
         {
             var peerKey = NormalizePairingKey(peer.PeerKey);
             if (peerKey.Length != 8 || string.Equals(peerKey, dollKey, StringComparison.Ordinal))
                 continue;
+
+            // Consent is only kept for partners; anything else would let a push restore or invent a pair's state.
+            if (!store.HasEstablishedPair(dollKey, peerKey))
+            {
+                unpaired++;
+                continue;
+            }
+
+            if (IsTooFarAhead(peer.UpdatedUtc, now))
+            {
+                RecordFutureStamp(dollKey, "consent");
+                continue;
+            }
 
             if (store.TryMergePairConsent(new PairConsentRow(
                     dollKey,
@@ -550,6 +612,27 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                     msgType: MessageTypes.DollStatePush);
             }
         }
+
+        if (unpaired > 0)
+        {
+            store.RecordEvent(
+                "pair_consent_unpaired",
+                pairingKey: dollKey,
+                msgType: MessageTypes.DollStatePush,
+                detail: unpaired.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    private static bool IsTooFarAhead(string? stamp, DateTimeOffset now) =>
+        SyncStamp.TryParse(stamp, out var parsed) && SyncStamp.IsTooFarAhead(parsed, now);
+
+    /// <summary>A client with a fast clock pushes on every change: record and log at most once per key per window.</summary>
+    private void RecordFutureStamp(string dollKey, string what)
+    {
+        if (!_futureStampRecords.TryAcquire(dollKey))
+            return;
+        store.RecordEvent("future_stamp_rejected", pairingKey: dollKey, msgType: MessageTypes.DollStatePush, detail: what);
+        log.LogInformation("Rejected a {What} stamp too far in the future key={Key}", what, dollKey);
     }
 
     private async Task HandlePairSubmitAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -638,11 +721,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             PeerKey = peerKey,
         });
 
-        if (_byPairingKey.TryGetValue(toKey, out var session) && session.IsOpen)
-        {
-            await session.SendAsync(envelope, ct);
+        if (await TryDeliverAsync(peerKey, toKey, MessageTypes.PairEstablished, envelope))
             return;
-        }
 
         store.EnqueueOutbox(null, peerKey, toKey, MessageTypes.PairEstablished, envelope.Serialize(), PairOutboxTtl);
         store.RecordEvent("queue", pairingKey: peerKey, peerKey: toKey, msgType: MessageTypes.PairEstablished);
@@ -658,21 +738,28 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (peerKey.Length != 8)
             return;
 
-        store.RemovePair(session.PairingKey, peerKey);
-        store.RecordEvent("pair_remove", pairingKey: session.PairingKey, peerKey: peerKey);
+        var removal = store.RemovePair(session.PairingKey, peerKey);
+        store.RecordEvent(
+            "pair_remove",
+            pairingKey: session.PairingKey,
+            peerKey: peerKey,
+            detail: removal.Purged > 0 ? $"purged={removal.Purged}" : null);
 
         var notify = Envelope.Create(MessageTypes.PairRemove, new PairRemovePayload
         {
             PeerKey = session.PairingKey,
         });
 
-        if (_byPairingKey.TryGetValue(peerKey, out var peer) && peer.IsOpen)
-        {
-            await peer.SendAsync(notify, ct);
+        if (await TryDeliverAsync(session.PairingKey, peerKey, MessageTypes.PairRemove, notify))
             return;
-        }
 
-        store.EnqueueOutbox(null, session.PairingKey, peerKey, MessageTypes.PairRemove, notify.Serialize(), PairOutboxTtl);
+        // Delivered live unconditionally, but queued for an offline peer only when it removed an established pair or the
+        // peer's own pending submit: otherwise there's nothing for the peer to drop. One pending notice per sender and
+        // peer is enough, so nobody can fill a key's outbox with them.
+        if (!removal.Removed)
+            return;
+
+        store.EnqueueOutboxOnce(null, session.PairingKey, peerKey, MessageTypes.PairRemove, notify.Serialize(), PairOutboxTtl);
     }
 
     private async Task HandlePresenceQueryAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -702,16 +789,17 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
 
-        if (!_byPairingKey.TryGetValue(payload.To, out var target) || !target.IsOpen)
+        // Presence is only for partners. An unpaired target gets exactly the offline answer and no forward, so the
+        // sender can't tell "unpaired" from "offline" or "unknown". A target whose socket fails is offline too.
+        var online = false;
+        if (MayRoute(session.PairingKey, payload.To))
         {
-            await session.SendAsync(Envelope.Create(MessageTypes.PresenceResult, new PresenceResultPayload
-            {
-                RequestId = payload.RequestId,
-                From = payload.To,
-                To = session.PairingKey,
-                Online = false,
-            }), ct);
-            return;
+            online = await TryDeliverAsync(
+                session.PairingKey, payload.To, MessageTypes.PresenceQuery, Envelope.Create(MessageTypes.PresenceQuery, payload));
+        }
+        else
+        {
+            RecordNotPaired(session.PairingKey, payload.To, MessageTypes.PresenceQuery);
         }
 
         await session.SendAsync(Envelope.Create(MessageTypes.PresenceResult, new PresenceResultPayload
@@ -719,10 +807,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             RequestId = payload.RequestId,
             From = payload.To,
             To = session.PairingKey,
-            Online = true,
+            Online = online,
         }), ct);
-
-        await target.SendAsync(Envelope.Create(MessageTypes.PresenceQuery, payload), ct);
     }
 
     private async Task HandleWindAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -751,6 +837,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
+        if (!await RequirePairAsync(session, payload.RequestId, payload.To, MessageTypes.Wind, ct))
+            return;
+
         var forward = Envelope.Create(MessageTypes.Wind, payload);
         await DeliverOrQueueAsync(session, payload.RequestId, payload.To, MessageTypes.Wind, forward, WindOutboxTtl, ct);
     }
@@ -781,6 +870,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
+        if (!await RequirePairAsync(session, payload.RequestId, payload.To, MessageTypes.Unwind, ct))
+            return;
+
         var forward = Envelope.Create(MessageTypes.Unwind, payload);
         await DeliverOrQueueAsync(session, payload.RequestId, payload.To, MessageTypes.Unwind, forward, WindOutboxTtl, ct);
     }
@@ -873,13 +965,13 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         // Never persist optional identity labels in the outbox — strip before queue/forward.
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
+        if (!await RequirePairAsync(session, null, payload.To, MessageTypes.OwnerGrant, ct))
+            return;
+
         var identity = payload.Identity;
         var live = Envelope.Create(MessageTypes.OwnerGrant, payload);
-        if (_byPairingKey.TryGetValue(payload.To, out var target) && target.IsOpen)
-        {
-            await target.SendAsync(live, ct);
+        if (await TryDeliverAsync(session.PairingKey, payload.To, MessageTypes.OwnerGrant, live))
             return;
-        }
 
         payload.Identity = null;
         var queued = Envelope.Create(MessageTypes.OwnerGrant, payload);
@@ -913,8 +1005,25 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
+
+        // 02-D28: delivered or queued only between keys with an established pair (or to oneself). The client sends it
+        // just before its pairRemove, so nothing is lost; a refused one is dropped silently, with a throttled event.
+        if (!MayRoute(session.PairingKey, payload.To))
+        {
+            RecordNotPaired(session.PairingKey, payload.To, MessageTypes.OwnerRevoked);
+            return;
+        }
+
         var forward = Envelope.Create(MessageTypes.OwnerRevoked, payload);
-        await DeliverOrQueueSilentAsync(session.PairingKey, payload.To, MessageTypes.OwnerRevoked, forward, OwnerOutboxTtl, ct);
+        if (await TryDeliverAsync(session.PairingKey, payload.To, MessageTypes.OwnerRevoked, forward))
+            return;
+
+        // 02-D29: at most one pending copy per sender and recipient. RemovePair keeps it, so the pairRemove that
+        // usually follows doesn't drop it. 02-D31: the grants queued before it go, so none is delivered after it.
+        var queued = store.EnqueueOutboxOnce(null, session.PairingKey, payload.To, MessageTypes.OwnerRevoked,
+            forward.Serialize(), OwnerOutboxTtl, supersedes: MessageTypes.OwnerGrant);
+        if (queued is not null)
+            store.RecordEvent("queue", pairingKey: session.PairingKey, peerKey: payload.To, msgType: MessageTypes.OwnerRevoked);
     }
 
     private async Task HandleOwnerSettingsQueryAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -943,6 +1052,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
+        if (!await RequirePairAsync(session, payload.RequestId, payload.To, MessageTypes.OwnerSettingsQuery, ct))
+            return;
+
         var forward = Envelope.Create(MessageTypes.OwnerSettingsQuery, payload);
         await DeliverOrQueueAsync(session, payload.RequestId, payload.To, MessageTypes.OwnerSettingsQuery, forward, OwnerOutboxTtl, ct);
     }
@@ -973,6 +1085,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
+        if (!await RequirePairAsync(session, payload.RequestId, payload.To, MessageTypes.OwnerSettingsUpdate, ct))
+            return;
+
         var forward = Envelope.Create(MessageTypes.OwnerSettingsUpdate, payload);
         await DeliverOrQueueAsync(session, payload.RequestId, payload.To, MessageTypes.OwnerSettingsUpdate, forward, OwnerOutboxTtl, ct);
     }
@@ -1004,13 +1119,12 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         payload.From = session.PairingKey;
         payload.To = NormalizePairingKey(payload.To);
-        var forward = Envelope.Create(MessageTypes.Call, payload);
-
-        if (_byPairingKey.TryGetValue(payload.To, out var target) && target.IsOpen)
-        {
-            await target.SendAsync(forward, ct);
+        if (!await RequirePairAsync(session, payload.RequestId, payload.To, MessageTypes.Call, ct))
             return;
-        }
+
+        var forward = Envelope.Create(MessageTypes.Call, payload);
+        if (await TryDeliverAsync(session.PairingKey, payload.To, MessageTypes.Call, forward))
+            return;
 
         await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
         {
@@ -1030,13 +1144,10 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         TimeSpan ttl,
         CancellationToken ct)
     {
-        if (_byPairingKey.TryGetValue(toKey, out var target) && target.IsOpen)
-        {
-            await target.SendAsync(forward, ct);
-            return;
-        }
-
         if (sender.PairingKey is null)
+            return;
+
+        if (await TryDeliverAsync(sender.PairingKey, toKey, msgType, forward))
             return;
 
         store.EnqueueOutbox(requestId, sender.PairingKey, toKey, msgType, forward.Serialize(), ttl);
@@ -1053,32 +1164,72 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
     }
 
-    private async Task DeliverOrQueueSilentAsync(
-        string fromKey,
-        string toKey,
-        string msgType,
-        Envelope forward,
-        TimeSpan ttl,
-        CancellationToken ct)
+    /// <summary>
+    /// Sends to the open session holding <paramref name="toKey"/>. False when it's offline or the send didn't happen
+    /// (its socket died or was aborted meanwhile, or it didn't take the frame within <see cref="SendTimeout"/>;
+    /// recorded as <c>send_failed</c>): callers then treat it as offline. A recipient's failure never throws into the
+    /// sender's loop. The send is bounded by its own timeout only, never by the sender's token: the sender
+    /// disconnecting must not abort the recipient's socket.
+    /// </summary>
+    private async Task<bool> TryDeliverAsync(string? fromKey, string toKey, string msgType, Envelope envelope)
     {
-        if (_byPairingKey.TryGetValue(toKey, out var target) && target.IsOpen)
+        if (!_byPairingKey.TryGetValue(toKey, out var target) || !target.IsOpen)
+            return false;
+
+        if (await target.TrySendAsync(envelope, SendTimeout))
+            return true;
+
+        store.RecordEvent("send_failed", pairingKey: fromKey, peerKey: toKey, msgType: msgType);
+        log.LogDebug("Send to key={Key} failed; treated as offline", toKey);
+        return false;
+    }
+
+    /// <summary>Messages to oneself (the debug self-pair) are always allowed; anything else needs an established pair.</summary>
+    private bool MayRoute(string fromKey, string toKey) =>
+        RoutingRules.MayRoute(fromKey, toKey, () => store.HasEstablishedPair(fromKey, toKey));
+
+    /// <summary>
+    /// True when <paramref name="sender"/> may address <paramref name="toKey"/>. Otherwise nothing is forwarded or
+    /// queued, and the sender gets a generic <c>not_allowed</c> for <paramref name="requestId"/>. Without a requestId
+    /// (ownerGrant) there's nothing for the client to match it to, and old and new clients alike would print a wind
+    /// failure for it (a doll re-sends its grants on every connect), so it's dropped silently.
+    /// </summary>
+    private async Task<bool> RequirePairAsync(ClientSession sender, string? requestId, string toKey, string msgType, CancellationToken ct)
+    {
+        if (sender.PairingKey is not { } fromKey)
+            return false;
+        if (MayRoute(fromKey, toKey))
+            return true;
+
+        RecordNotPaired(fromKey, toKey, msgType);
+        if (!string.IsNullOrEmpty(requestId))
         {
-            await target.SendAsync(forward, ct);
-            return;
+            await sender.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+            {
+                RequestId = requestId,
+                To = fromKey,
+                Code = ErrorCodes.NotAllowed,
+                Message = "not allowed",
+            }), ct);
         }
 
-        store.EnqueueOutbox(null, fromKey, toKey, msgType, forward.Serialize(), ttl);
-        store.RecordEvent("queue", pairingKey: fromKey, peerKey: toKey, msgType: msgType);
-        await Task.CompletedTask;
+        return false;
+    }
+
+    /// <summary>Probes or a relay host missing the pair: record at most once per sender per window.</summary>
+    private void RecordNotPaired(string fromKey, string toKey, string msgType)
+    {
+        if (_notPairedRecords.TryAcquire(fromKey))
+            store.RecordEvent("route_not_paired", pairingKey: fromKey, peerKey: toKey, msgType: msgType);
     }
 
     private async Task FlushOutboxAsync(ClientSession session, CancellationToken ct)
     {
-        if (session.PairingKey is null)
+        if (session.PairingKey is not { } key)
             return;
 
         store.ExpirePending();
-        foreach (var row in store.TakePendingFor(session.PairingKey))
+        foreach (var row in store.TakePendingFor(key))
         {
             var envelope = Envelope.TryParse(row.EnvelopeJson);
             if (envelope is null)
@@ -1087,74 +1238,110 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                 continue;
             }
 
-            await session.SendAsync(envelope, ct);
+            // The pair may be gone since this was queued (e.g. on another relay host, or a removal racing it).
+            if (RoutingRules.RequiresPair(row.MsgType) && !MayRoute(row.FromKey, key))
+            {
+                store.MarkExpired(row.Id);
+                store.RecordEvent("outbox_drop_unpaired", pairingKey: row.FromKey, peerKey: key, msgType: row.MsgType);
+                continue;
+            }
+
+            // Delivered only when the frame was actually sent; the rest stays pending for the next register.
+            if (!await session.SendAsync(envelope, ct))
+            {
+                store.RecordEvent("send_failed", pairingKey: row.FromKey, peerKey: key, msgType: row.MsgType);
+                break;
+            }
+
             store.MarkDelivered(row.Id);
-            store.RecordEvent("deliver", pairingKey: row.FromKey, peerKey: session.PairingKey, msgType: row.MsgType);
+            store.RecordEvent("deliver", pairingKey: row.FromKey, peerKey: key, msgType: row.MsgType);
 
             if (string.IsNullOrEmpty(row.RequestId))
                 continue;
 
-            if (_byPairingKey.TryGetValue(row.FromKey, out var sender) && sender.IsOpen)
-            {
-                await sender.SendAsync(Envelope.Create(MessageTypes.DeliveryDelivered, new DeliveryStatusPayload
+            await TryDeliverAsync(key, row.FromKey, MessageTypes.DeliveryDelivered, Envelope.Create(
+                MessageTypes.DeliveryDelivered,
+                new DeliveryStatusPayload
                 {
                     RequestId = row.RequestId,
-                    To = session.PairingKey,
+                    To = key,
                     Type = row.MsgType,
-                }), ct);
-            }
+                }));
         }
     }
 
-    private async Task RouteByKeyAsync(Envelope envelope, CancellationToken ct)
+    /// <summary>
+    /// Routes a reply to its <c>to</c>. The relay sets <c>from</c> to the sender's own key, whatever the sender wrote,
+    /// and delivers only between keys with an established pair (or to oneself). A reply that may not be delivered is
+    /// dropped without an answer, since an error back would itself be a reply.
+    /// </summary>
+    private async Task RouteReplyAsync(ClientSession session, Envelope envelope, CancellationToken ct)
     {
+        if (session.PairingKey is not { } fromKey)
+            return;
+
         // Relay-only session codes can't be forged by addressing an error to another key.
         if (envelope.Type == MessageTypes.Error
             && ErrorCodes.IsRelayOnly(envelope.GetPayload<ErrorPayload>()?.Code))
             return;
 
-        string? to = envelope.Type switch
+        var reply = envelope.Type switch
         {
-            MessageTypes.WindResult => NormalizePairingKey(envelope.GetPayload<WindResultPayload>()?.To),
-            MessageTypes.PresenceResult => NormalizePairingKey(envelope.GetPayload<PresenceResultPayload>()?.To),
-            MessageTypes.OwnerSettingsResult => NormalizePairingKey(envelope.GetPayload<OwnerSettingsResultPayload>()?.To),
-            MessageTypes.OwnerSettingsAck => NormalizePairingKey(envelope.GetPayload<OwnerSettingsAckPayload>()?.To),
-            MessageTypes.CallAck => NormalizePairingKey(envelope.GetPayload<CallAckPayload>()?.To),
-            MessageTypes.CallResult => NormalizePairingKey(envelope.GetPayload<CallResultPayload>()?.To),
-            MessageTypes.Error => NormalizePairingKey(envelope.GetPayload<ErrorPayload>()?.To),
+            MessageTypes.WindResult => Restamp<WindResultPayload>(
+                envelope, fromKey, p => p.To, p => p.RequestId, (p, from, to) => (p.From, p.To) = (from, to)),
+            MessageTypes.PresenceResult => Restamp<PresenceResultPayload>(
+                envelope, fromKey, p => p.To, p => p.RequestId, (p, from, to) => (p.From, p.To) = (from, to)),
+            MessageTypes.OwnerSettingsResult => Restamp<OwnerSettingsResultPayload>(
+                envelope, fromKey, p => p.To, p => p.RequestId, (p, from, to) => (p.From, p.To) = (from, to)),
+            MessageTypes.OwnerSettingsAck => Restamp<OwnerSettingsAckPayload>(
+                envelope, fromKey, p => p.To, p => p.RequestId, (p, from, to) => (p.From, p.To) = (from, to)),
+            MessageTypes.CallAck => Restamp<CallAckPayload>(
+                envelope, fromKey, p => p.To, p => p.RequestId, (p, from, to) => (p.From, p.To) = (from, to)),
+            MessageTypes.CallResult => Restamp<CallResultPayload>(
+                envelope, fromKey, p => p.To, p => p.RequestId, (p, from, to) => (p.From, p.To) = (from, to)),
+            MessageTypes.Error => Restamp<ErrorPayload>(
+                envelope, fromKey, p => p.To, p => p.RequestId, (p, from, to) => (p.From, p.To) = (from, to)),
             _ => null,
         };
 
-        if (envelope.Type == MessageTypes.WindResult)
-        {
-            var rid = envelope.GetPayload<WindResultPayload>()?.RequestId;
-            if (!string.IsNullOrEmpty(rid))
-                store.MarkAckedByRequestId(rid);
-        }
-        else if (envelope.Type is MessageTypes.OwnerSettingsResult or MessageTypes.OwnerSettingsAck)
-        {
-            var rid = envelope.Type == MessageTypes.OwnerSettingsResult
-                ? envelope.GetPayload<OwnerSettingsResultPayload>()?.RequestId
-                : envelope.GetPayload<OwnerSettingsAckPayload>()?.RequestId;
-            if (!string.IsNullOrEmpty(rid))
-                store.MarkAckedByRequestId(rid);
-        }
-        else if (envelope.Type is MessageTypes.CallAck or MessageTypes.CallResult)
-        {
-            var rid = envelope.Type == MessageTypes.CallAck
-                ? envelope.GetPayload<CallAckPayload>()?.RequestId
-                : envelope.GetPayload<CallResultPayload>()?.RequestId;
-            if (!string.IsNullOrEmpty(rid))
-                store.MarkAckedByRequestId(rid);
-        }
-
-        if (string.IsNullOrWhiteSpace(to) || to.Length != 8)
+        if (reply is not { } readable || readable.To.Length != 8)
             return;
 
-        if (!_byPairingKey.TryGetValue(to, out var dest) || !dest.IsOpen)
-            return;
+        var (routed, to, requestId) = readable;
 
-        await dest.SendAsync(envelope, ct);
+        if (!MayRoute(fromKey, to))
+        {
+            RecordNotPaired(fromKey, to, envelope.Type);
+            return;
+        }
+
+        // Only the recipient of a queued message can ack it, and only toward the key that sent it.
+        if (!string.IsNullOrEmpty(requestId)
+            && envelope.Type is MessageTypes.WindResult or MessageTypes.OwnerSettingsResult or MessageTypes.OwnerSettingsAck
+                or MessageTypes.CallAck or MessageTypes.CallResult)
+        {
+            store.MarkAckedByRequestId(requestId, ackerKey: fromKey, senderKey: to);
+        }
+
+        await TryDeliverAsync(fromKey, to, envelope.Type, routed);
+    }
+
+    /// <summary>The reply re-serialized with <c>from</c> set to the sender and <c>to</c> normalized, or null when unreadable.</summary>
+    private static (Envelope Routed, string To, string? RequestId)? Restamp<T>(
+        Envelope envelope,
+        string fromKey,
+        Func<T, string?> getTo,
+        Func<T, string?> getRequestId,
+        Action<T, string, string> stamp)
+        where T : class
+    {
+        var payload = envelope.GetPayload<T>();
+        if (payload is null)
+            return null;
+
+        var to = NormalizePairingKey(getTo(payload));
+        stamp(payload, fromKey, to);
+        return (Envelope.Create(envelope.Type, payload), to, getRequestId(payload));
     }
 
     internal static string NormalizePairingKey(string? key)
@@ -1166,7 +1353,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     }
 }
 
-internal sealed class ClientSession(WebSocket socket)
+/// <param name="sendTimeout">How long any one send may take (see <see cref="SessionHub.SendTimeout"/>).</param>
+internal sealed class ClientSession(WebSocket socket, TimeSpan sendTimeout)
 {
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
@@ -1204,19 +1392,76 @@ internal sealed class ClientSession(WebSocket socket)
     /// <summary>Drops the connection without a close handshake (for a socket that is stuck).</summary>
     public void Abort() => socket.Abort();
 
-    public async Task SendAsync(Envelope envelope, CancellationToken ct)
+    /// <summary>
+    /// A send on this session's own loop (or from its takeover): bounded by <paramref name="ct"/> and by the send
+    /// timeout. True when the frame was actually sent. False when it wasn't (see <see cref="TrySendCoreAsync"/>), or
+    /// when this session didn't take it within the send timeout: it isn't reading, so it's aborted rather than left
+    /// holding its send lock. Only <paramref name="ct"/> itself being cancelled throws. Cancelling
+    /// <paramref name="ct"/> during the send aborts this socket, so another session's token must never be passed
+    /// here: use <see cref="TrySendAsync"/>.
+    /// </summary>
+    public async Task<bool> SendAsync(Envelope envelope, CancellationToken ct)
+    {
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bounded.CancelAfter(sendTimeout);
+        try
+        {
+            return await TrySendCoreAsync(envelope, bounded.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Timed out, sending or waiting for the send lock: this session stopped reading.
+            Abort();
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// True when the frame was actually sent. False when the socket wasn't open, or it died or was aborted during the
+    /// send (an abort surfaces as <see cref="OperationCanceledException"/> with <paramref name="ct"/> not cancelled):
+    /// that is this session's peer failing, so it never throws into the loop of whichever session is sending to it.
+    /// Only <paramref name="ct"/> being cancelled throws.
+    /// </summary>
+    private async Task<bool> TrySendCoreAsync(Envelope envelope, CancellationToken ct)
     {
         var bytes = Encoding.UTF8.GetBytes(envelope.Serialize());
         await _sendLock.WaitAsync(ct);
         try
         {
             if (socket.State != WebSocketState.Open)
-                return;
+                return false;
             await socket.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
+            return true;
+        }
+        catch (Exception ex) when (ex is WebSocketException or IOException or ObjectDisposedException
+                                       || (ex is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            return false;
         }
         finally
         {
             _sendLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// A send from another session: bounded by its own <paramref name="timeout"/>, not by the sending session's token.
+    /// False when the frame wasn't sent, including when this session didn't take it in time. Either way that timeout
+    /// aborts this socket, as a stuck one: whether the send itself was cut off, or it was still waiting for the send
+    /// lock held by a stuck send. So partners don't stall on a wedged session again and again.
+    /// </summary>
+    public async Task<bool> TrySendAsync(Envelope envelope, TimeSpan timeout)
+    {
+        using var cts = new CancellationTokenSource(timeout);
+        try
+        {
+            return await TrySendCoreAsync(envelope, cts.Token);
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            // Timed out: this session stopped reading (or its send lock is held by such a send).
+            Abort();
+            return false;
         }
     }
 
@@ -1227,16 +1472,32 @@ internal sealed class ClientSession(WebSocket socket)
     /// </summary>
     public async Task CloseAsync(WebSocketCloseStatus status, string description, CancellationToken ct)
     {
-        await _sendLock.WaitAsync(ct);
+        // Bounded like any send: a peer that doesn't take the close frame is aborted instead.
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bounded.CancelAfter(sendTimeout);
+        try
+        {
+            await _sendLock.WaitAsync(bounded.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            Abort();
+            return;
+        }
+
         try
         {
             if (socket.State != WebSocketState.Open)
                 return;
-            await socket.CloseOutputAsync(status, description, ct);
+            await socket.CloseOutputAsync(status, description, bounded.Token);
         }
         catch (WebSocketException)
         {
             // Peer already gone.
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            Abort();
         }
         finally
         {
