@@ -1,4 +1,5 @@
 using System.Net.WebSockets;
+using WindUpKey.Protocol;
 
 /// <summary>
 /// The <c>/ws</c> endpoint: token check, connection admission (03-D9), then the session. Kept out of the top-level
@@ -17,6 +18,46 @@ internal sealed class RelayWebSocketEndpoint(string relayToken, SessionHub sessi
     /// </summary>
     public static void LimitUpgradedConnections(ConfigureWebHostBuilder webHost, int maxConnections) =>
         webHost.ConfigureKestrel(options => options.Limits.MaxConcurrentUpgradedConnections = maxConnections);
+
+    /// <summary>
+    /// 05-D3: the keep-alive settings, from <c>Relay:KeepAliveIntervalSeconds</c> and <c>Relay:KeepAliveTimeoutSeconds</c>
+    /// (defaults 30 and 90, the client's own). 0 turns that part off, for rollback: an interval of 0 sends no pings (so
+    /// nothing can time out), a timeout of 0 keeps the pings but never drops a peer for a missing pong. Anything that
+    /// isn't a whole, non-negative number of seconds gets the default (05-D11: only 0 means off).
+    /// </summary>
+    public static KeepAliveSettings KeepAliveFromConfig(IConfiguration configuration) => new(
+        NonNegative(configuration["Relay:KeepAliveIntervalSeconds"], (int)WireLimits.KeepAliveInterval.TotalSeconds, 24 * 60 * 60),
+        NonNegative(configuration["Relay:KeepAliveTimeoutSeconds"], (int)WireLimits.KeepAliveTimeout.TotalSeconds, 24 * 60 * 60));
+
+    /// <summary>
+    /// 05-D2: the first-bind limiter, from <c>Relay:FirstBindsPerIpPerHour</c> and <c>Relay:FirstBindsPerIpPerDay</c>
+    /// (defaults 5 and 20 when a value is missing; the shipped appsettings.json turns both off until the live Funnel
+    /// check passes, 05-D8). 0 turns a limit off; anything that isn't a whole, non-negative number gets the default
+    /// (05-D11).
+    /// </summary>
+    public static FirstBindLimiter FirstBindsFromConfig(IConfiguration configuration, TimeProvider? timeProvider = null) => new(
+        NonNegative(configuration["Relay:FirstBindsPerIpPerHour"], FirstBindLimiter.DefaultPerHour, 100_000),
+        NonNegative(configuration["Relay:FirstBindsPerIpPerDay"], FirstBindLimiter.DefaultPerDay, 100_000),
+        timeProvider);
+
+    private static int NonNegative(string? raw, int fallback, int max) =>
+        int.TryParse(raw, out var value) && value >= 0 ? Math.Min(value, max) : fallback;
+
+    /// <summary>
+    /// 05-D3: the one <see cref="WebSocketOptions"/> builder, shared by the relay and its tests. The relay pings every
+    /// interval and aborts a connection whose pong hasn't come within the timeout (about interval + timeout after it went
+    /// quiet), so a half-open peer no longer holds its session, its per-IP slot and its key's routing.
+    /// </summary>
+    public static WebSocketOptions BuildWebSocketOptions(KeepAliveSettings keepAlive)
+    {
+        var options = new WebSocketOptions
+        {
+            KeepAliveInterval = keepAlive.IntervalSeconds > 0 ? TimeSpan.FromSeconds(keepAlive.IntervalSeconds) : TimeSpan.Zero,
+        };
+        if (keepAlive.IntervalSeconds > 0 && keepAlive.TimeoutSeconds > 0)
+            options.KeepAliveTimeout = TimeSpan.FromSeconds(keepAlive.TimeoutSeconds);
+        return options;
+    }
 
     public static bool IsAuthorized(HttpContext context, string relayToken)
     {
@@ -74,8 +115,10 @@ internal sealed class RelayWebSocketEndpoint(string relayToken, SessionHub sessi
                 return;
             }
 
+            // 05-D2: first binds are limited per client address too, with IPv6 per /48 (05-D7). Never logged.
+            var firstBindKey = ConnectionGate.ClientKey(context.Connection.RemoteIpAddress, forwardedFor, FirstBindLimiter.Ipv6PrefixBits);
             using (socket)
-                await sessions.HandleClientAsync(socket, context.RequestAborted);
+                await sessions.HandleClientAsync(socket, firstBindKey, context.RequestAborted);
         }
     }
 
@@ -87,3 +130,6 @@ internal sealed class RelayWebSocketEndpoint(string relayToken, SessionHub sessi
             log.LogWarning("Refused a relay connection: {Reason} (at most one log per 5 minutes)", reason);
     }
 }
+
+/// <summary>05-D3: keep-alive interval and timeout in seconds; 0 turns that part off.</summary>
+internal readonly record struct KeepAliveSettings(int IntervalSeconds, int TimeoutSeconds);

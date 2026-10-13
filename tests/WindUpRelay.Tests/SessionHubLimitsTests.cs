@@ -322,6 +322,13 @@ public sealed partial class SessionHubTests
             return json;
         }
 
+        // 05-D1: both were asked for, so it's only the size that can stop the first.
+        foreach (var requestId in new[] { "amplified", "plain" })
+        {
+            await owner.SendAsync(MessageTypes.OwnerSettingsQuery, new OwnerSettingsQueryPayload { RequestId = requestId, To = Peer });
+            await doll.ExpectTypeAsync(MessageTypes.OwnerSettingsQuery);
+        }
+
         await doll.SendRawAsync(Result("amplified", '<'));
         Assert.Null(await owner.NextAsync(Quiet));
         Assert.Equal(1, CountEvents("routed_too_big"));

@@ -137,6 +137,12 @@ which the plugin's debug self-pair uses):
 * Replies (`presenceResult`, `windResult`, `ownerSettingsResult`, `ownerSettingsAck`, `callAck`,
   `callResult` and routed `error`s) get `from` set to the sender's own key, and are dropped unless
   the two keys are paired.
+* An `ownerSettingsResult` (the only reply that can approach 64 KiB) is routed only when it was asked
+  for: the relay delivered that owner's `ownerSettingsQuery` with the same request ID to this doll
+  live within the last 2 minutes (kept in memory, used once), or delivered it from the outbox within
+  the last 10 minutes and no result has acked that row yet. Anything else is dropped with no reply (`reply_unrequested`,
+  recorded at most once per key every 5 minutes). Every other reply is routed as before: they're
+  small, and many legitimately arrive long after their request.
 * A `presenceQuery` for a key that isn't a partner gets the same answer as an offline key, and isn't
   forwarded.
 * Queued messages are checked again when they're delivered: if the pair is gone, they're expired
@@ -224,6 +230,36 @@ per-IP cap at all (only the global one), so a missing header can't make everyone
 (see `plans/IN-GAME-CHECKS.md` in the plugin repo). If the relay is bound to a non-loopback address,
 the TCP peer's own address is used and headers are ignored.
 
+**First binds.** `Relay:FirstBindsPerIpPerHour` and `Relay:FirstBindsPerIpPerDay` cap how many
+accounts one client address (found as for the per-IP cap: `X-Forwarded-For` from loopback, but IPv6
+per /48) may create, in `Bind` and `Enforce`; 0 turns a limit off, and a missing or negative value
+means 5 and 20. **The shipped `appsettings.json` sets both to 0 (off).** Turn them on, at 5 and 20,
+only after the live Funnel forwarded-IP header check passes (see `plans/IN-GAME-CHECKS.md` in the
+plugin repo): a header that doesn't carry each client's own address would put many users under one
+limit. Only real account creations
+count; registers for existing accounts, failed and secretless ones never do. A register that would
+create an account over the limit creates none and isn't mapped (no legacy fallback): the connection
+is closed with `1013` / `bind_rate_limited`, the plugin says the relay is limiting new accounts from
+its network, and it reconnects on its normal backoff. Without the header there is no limit, as for
+the per-IP cap, and none for a new address while the limiter's table (65,536 addresses) is full. The
+event `bind_rate_limited` is keyed by pairing key and recorded at most once per key every 5 minutes
+(`bind_race` instead when a concurrent first bind won but its account is gone on re-read, with the
+same close); the address is never recorded or logged.
+
+**Keep-alive.** The relay pings every connection every `Relay:KeepAliveIntervalSeconds` (default 30)
+and drops one whose pong hasn't come within `Relay:KeepAliveTimeoutSeconds` (default 90), so a dead
+peer is noticed after about two minutes instead of holding its key, routing and per-IP slot until
+TCP gives up (`keepalive_timeout`, recorded at most once per key every 5 minutes). New plugins ping
+the relay the same way; old plugins answer the relay's pings. An interval of 0 turns pings off
+entirely, and a timeout of 0 keeps the pings but never drops a peer for a missing pong (both for
+rollback).
+
+**Closing.** The relay answers a client's close frame, so clients no longer see "closed without
+completing the handshake" (a client that disposes without closing is logged at Debug only). A
+session taken over by another that doesn't answer the relay's close within 2 seconds (it stopped
+reading) is dropped, so it can't keep its per-IP slot; any close the relay starts is bounded the
+same way.
+
 **Events.** Every event added for these limits (`message_too_big`, `binary_message`,
 `register_timeout`, `register_required`, `routed_too_big`, `queue_full`, `outbox_row_too_big`) and
 `rate_limited` is recorded at most once per key every 5 minutes (once for all unregistered
@@ -232,3 +268,6 @@ connections together). An event records a message type only when it's a known on
 
 No protocol version change: `queue_full` is the only new code a client can receive. Deploy this
 relay before the plugin release that goes with it.
+
+New plugins no longer send the shared token in the `register` body (no relay ever read it there; it
+is checked only at the WebSocket upgrade, from `Authorization: Bearer` or `?token=`).

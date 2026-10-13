@@ -76,6 +76,10 @@ public sealed partial class SessionHubTests
         var sender = await RegisterOkAsync(hub, Peer, null);
         Pair(Key, Peer);
 
+        // 05-D1: a settings result is routed only when it was asked for.
+        await target.SendAsync(MessageTypes.OwnerSettingsQuery, new OwnerSettingsQueryPayload { RequestId = "r3", To = Peer });
+        await sender.ExpectTypeAsync(MessageTypes.OwnerSettingsQuery);
+
         foreach (var (type, payload) in ForgedReplies(Key))
         {
             await sender.SendAsync(type, payload);

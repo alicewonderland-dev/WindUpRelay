@@ -53,23 +53,28 @@ public sealed partial class SessionHubTests : IDisposable
         string mode,
         TimeSpan? sendTimeout = null,
         int maxMessagesPerMinute = 1000,
-        TimeSpan? registerTimeout = null) =>
+        TimeSpan? registerTimeout = null,
+        RequestedReplies? settingsQueries = null,
+        FirstBindLimiter? firstBinds = null) =>
         new(NullLogger.Instance, _store, maxMessagesPerMinute, Enum.Parse<RelayAuthMode>(mode))
         {
             SendTimeout = sendTimeout ?? SessionHub.DefaultSendTimeout,
             RegisterTimeout = registerTimeout ?? WireLimits.RegisterTimeout,
+            SettingsQueries = settingsQueries ?? new RequestedReplies(),
+            FirstBinds = firstBinds ?? new FirstBindLimiter(FirstBindLimiter.DefaultPerHour, FirstBindLimiter.DefaultPerDay),
         };
 
     /// <summary>
     /// <paramref name="requestAborted"/> stands in for this connection's own <c>RequestAborted</c> (all connections
     /// share the fixture's token otherwise).
     /// </summary>
-    private async Task<TestClient> ConnectAsync(SessionHub hub, bool reading = true, CancellationToken? requestAborted = null)
+    private async Task<TestClient> ConnectAsync(
+        SessionHub hub, bool reading = true, CancellationToken? requestAborted = null, string? firstBindKey = null)
     {
         var ct = requestAborted is { } own
             ? CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, own).Token
             : _cts.Token;
-        var client = await TestClient.ConnectAsync(hub, reading, ct);
+        var client = await TestClient.ConnectAsync(hub, reading, ct, firstBindKey);
         _clients.Add(client);
         return client;
     }
@@ -459,6 +464,12 @@ public sealed partial class SessionHubTests : IDisposable
         /// </summary>
         public void StallRelayWrites() => _serverStream.Stall();
 
+        /// <summary>
+        /// Each of the relay's writes to this client returns only <paramref name="delay"/> after its bytes went out: the
+        /// client already has the frame while the relay's send is still in progress.
+        /// </summary>
+        public void SlowRelayWriteReturns(TimeSpan delay) => _serverStream.DelayAfterWrite(delay);
+
         /// <summary>Starts reading a client created with <c>reading: false</c> (and lets stalled relay writes through).</summary>
         public void StartReading()
         {
@@ -470,7 +481,7 @@ public sealed partial class SessionHubTests : IDisposable
         /// <paramref name="reading"/> false never reads from the socket, with small buffers on both ends,
         /// so the relay's sends to it soon block: a stuck client.
         /// </summary>
-        public static async Task<TestClient> ConnectAsync(SessionHub hub, bool reading, CancellationToken ct)
+        public static async Task<TestClient> ConnectAsync(SessionHub hub, bool reading, CancellationToken ct, string? firstBindKey = null)
         {
             var listener = new TcpListener(IPAddress.Loopback, 0);
             listener.Start();
@@ -489,7 +500,7 @@ public sealed partial class SessionHubTests : IDisposable
                 var serverStream = new BreakableStream(serverTcp.GetStream());
                 var serverSocket = WebSocket.CreateFromStream(serverStream, new WebSocketCreationOptions { IsServer = true });
                 var clientSocket = WebSocket.CreateFromStream(tcp.GetStream(), new WebSocketCreationOptions { IsServer = false });
-                var serverTask = Task.Run(() => hub.HandleClientAsync(serverSocket, ct), ct);
+                var serverTask = Task.Run(() => hub.HandleClientAsync(serverSocket, firstBindKey, ct), ct);
                 return new TestClient(tcp, serverTcp, serverStream, serverSocket, clientSocket, serverTask, reading);
             }
             finally
@@ -647,6 +658,15 @@ public sealed partial class SessionHubTests : IDisposable
         private int _skip;
         private int _fail;
         private TaskCompletionSource? _stall;
+        private long _delayAfterWriteTicks;
+
+        public void DelayAfterWrite(TimeSpan delay) => Interlocked.Exchange(ref _delayAfterWriteTicks, delay.Ticks);
+
+        private async Task DelayAfterWriteAsync(CancellationToken ct)
+        {
+            if (Interlocked.Read(ref _delayAfterWriteTicks) is var ticks and > 0)
+                await Task.Delay(TimeSpan.FromTicks(ticks), ct);
+        }
 
         public void Stall() =>
             Interlocked.CompareExchange(ref _stall, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), null);
@@ -700,6 +720,7 @@ public sealed partial class SessionHubTests : IDisposable
             ThrowIfBroken();
             await WaitIfStalledAsync(ct);
             await inner.WriteAsync(buffer, ct);
+            await DelayAfterWriteAsync(ct);
         }
 
         public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
@@ -707,6 +728,7 @@ public sealed partial class SessionHubTests : IDisposable
             ThrowIfBroken();
             await WaitIfStalledAsync(ct);
             await inner.WriteAsync(buffer.AsMemory(offset, count), ct);
+            await DelayAfterWriteAsync(ct);
         }
 
         protected override void Dispose(bool disposing)

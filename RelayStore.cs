@@ -904,6 +904,44 @@ internal sealed class RelayStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// 05-D13: how long a delivered request row keeps matching its reply (<see cref="HasDeliveredRequest"/>). A doll
+    /// answers a flushed query as soon as it reads it, so an older delivery is no credit for a result.
+    /// </summary>
+    public static readonly TimeSpan DeliveredRequestWindow = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// 05-D1 (b): whether the outbox holds a row for <paramref name="requestId"/> of <paramref name="msgType"/> from
+    /// <paramref name="fromKey"/> to <paramref name="toKey"/> that was delivered and not yet acked. A reply's ack
+    /// (<see cref="MarkAckedByRequestId"/>) then makes the match single-use. Pending, acked and expired rows never match,
+    /// nor one delivered more than <see cref="DeliveredRequestWindow"/> ago (05-D13).
+    /// </summary>
+    public bool HasDeliveredRequest(string requestId, string fromKey, string toKey, string msgType)
+    {
+        if (string.IsNullOrWhiteSpace(requestId))
+            return false;
+
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                """
+                SELECT 1 FROM outbox
+                WHERE request_id = $rid AND from_key = $from AND to_key = $to AND msg_type = $type
+                  AND status = 'delivered' AND delivered_utc >= $since
+                LIMIT 1;
+                """;
+            cmd.Parameters.AddWithValue("$rid", requestId);
+            cmd.Parameters.AddWithValue("$from", fromKey);
+            cmd.Parameters.AddWithValue("$to", toKey);
+            cmd.Parameters.AddWithValue("$type", msgType);
+            // Round-trip ("O") UTC strings, as MarkDelivered stores them, order as text.
+            cmd.Parameters.AddWithValue("$since", DateTimeOffset.UtcNow.Subtract(DeliveredRequestWindow).ToString("O"));
+            return cmd.ExecuteScalar() is not null;
+        }
+    }
+
     public int ExpirePending()
     {
         lock (_gate)

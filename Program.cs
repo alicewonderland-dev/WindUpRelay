@@ -46,6 +46,11 @@ var maxConnections = int.TryParse(builder.Configuration["Relay:MaxConnections"],
 var maxConnectionsPerIp = int.TryParse(builder.Configuration["Relay:MaxConnectionsPerIp"], out var mpi)
     ? Math.Clamp(mpi, 1, 100_000)
     : 16;
+// 05-D2: accounts created per client address per hour and per day (Relay:FirstBindsPerIpPerHour / PerDay); 0 turns a
+// limit off.
+var firstBinds = RelayWebSocketEndpoint.FirstBindsFromConfig(builder.Configuration);
+// 05-D3: WebSocket keep-alive (Relay:KeepAliveIntervalSeconds / Relay:KeepAliveTimeoutSeconds); 0 turns it off.
+var keepAlive = RelayWebSocketEndpoint.KeepAliveFromConfig(builder.Configuration);
 
 if (resetAccountKey is not null)
 {
@@ -89,10 +94,13 @@ using var store = new RelayStore(dbPath);
 var deletedStamps = store.DeleteFutureSyncStamps(DateTimeOffset.UtcNow);
 log.LogInformation("Startup cleanup: {Count} future-stamped consent/wind row(s) deleted", deletedStamps);
 
-var sessions = new SessionHub(log, store, maxMessagesPerMinute, authMode);
+var sessions = new SessionHub(log, store, maxMessagesPerMinute, authMode)
+{
+    FirstBinds = firstBinds,
+};
 var endpoint = new RelayWebSocketEndpoint(relayToken, sessions, new ConnectionGate(maxConnections, maxConnectionsPerIp), log);
 
-app.UseWebSockets();
+app.UseWebSockets(RelayWebSocketEndpoint.BuildWebSocketOptions(keepAlive));
 app.MapGet("/", () => Results.Text("WindUpKey relay. Connect plugins to /ws"));
 app.MapGet("/stats", (HttpContext context) =>
 {
@@ -118,8 +126,10 @@ app.MapGet("/stats", (HttpContext context) =>
 app.Map("/ws", (RequestDelegate)endpoint.HandleAsync);
 
 log.LogInformation(
-    "WindUpKey relay listening on {Urls}; database={Db}; authMode={AuthMode}; maxConnections={Max}; maxConnectionsPerIp={PerIp}",
-    urls, dbPath, authMode, maxConnections, maxConnectionsPerIp);
+    "WindUpKey relay listening on {Urls}; database={Db}; authMode={AuthMode}; maxConnections={Max}; maxConnectionsPerIp={PerIp}; " +
+    "firstBindsPerIp={PerHour}/h,{PerDay}/day; keepAlive={Interval}s/{Timeout}s",
+    urls, dbPath, authMode, maxConnections, maxConnectionsPerIp, firstBinds.PerHour, firstBinds.PerDay,
+    keepAlive.IntervalSeconds, keepAlive.TimeoutSeconds);
 app.Run();
 
 internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesPerMinute, RelayAuthMode authMode)
@@ -142,6 +152,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     /// <summary>What events record for a client's message type that isn't a known one (03-D7).</summary>
     internal const string UnknownMsgType = "unknown";
 
+    /// <summary>05-D2: close 1013, "try again later" (it has no <see cref="WebSocketCloseStatus"/> name).</summary>
+    internal const WebSocketCloseStatus BindRateLimitedClose = (WebSocketCloseStatus)1013;
+
     private readonly ConcurrentDictionary<string, ClientSession> _byPairingKey =
         new(StringComparer.Ordinal);
 
@@ -158,6 +171,15 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     /// </summary>
     internal TimeSpan RegisterTimeout { get; init; } = WireLimits.RegisterTimeout;
 
+    /// <summary>
+    /// 05-D2: accounts created per client address. Consulted only for a register that would create one; a connection
+    /// without a client key (no usable forwarded header) is never limited. Settable for tests and from config.
+    /// </summary>
+    internal FirstBindLimiter FirstBinds { get; init; } = new(FirstBindLimiter.DefaultPerHour, FirstBindLimiter.DefaultPerDay);
+
+    /// <summary>05-D1 (a): the ownerSettingsQuerys delivered live, whose results may be routed back. Settable for tests.</summary>
+    internal RequestedReplies SettingsQueries { get; init; } = new();
+
     private readonly PerKeyThrottle _refusalRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _keySwitchRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _authFailureRecords = new(RefusalRecordWindow);
@@ -172,12 +194,20 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     private readonly PerKeyThrottle _routedTooBigRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _queueFullRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _outboxRowRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _unrequestedRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _bindLimitedRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _bindRaceRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _keepAliveRecords = new(RefusalRecordWindow);
 
     public int OnlineCount => _byPairingKey.Count(kv => kv.Value.IsOpen);
 
-    public async Task HandleClientAsync(WebSocket socket, CancellationToken ct)
+    /// <param name="firstBindKey">
+    /// The connection's client key for the 05-D2 first-bind limit (see <see cref="ConnectionGate.ClientKey"/>, with
+    /// IPv6 per <see cref="FirstBindLimiter.Ipv6PrefixBits"/>), or null when it has none. Never logged or recorded.
+    /// </param>
+    public async Task HandleClientAsync(WebSocket socket, string? firstBindKey = null, CancellationToken ct = default)
     {
-        var session = new ClientSession(socket, SendTimeout);
+        var session = new ClientSession(socket, SendTimeout) { FirstBindKey = firstBindKey };
         using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var deadline = EnforceRegisterDeadlineAsync(session, socket, deadlineCts.Token);
         try
@@ -223,9 +253,19 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                 await ProcessMessageAsync(session, message.Text!, ct);
             }
         }
+        catch (Exception) when (IsKeepAliveTimeout(socket, session))
+        {
+            // 05-D3: the peer stopped answering pings (a half-open path, or a client that stopped reading): an ordinary
+            // end, recorded below. The finally releases its key, and the endpoint its per-IP slot.
+        }
         catch (OperationCanceledException)
         {
-            // shut down
+            // shut down, or the socket was aborted (by this relay: a send timeout, a takeover, the register deadline)
+        }
+        catch (WebSocketException ex) when (ex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
+        {
+            // 05-D4: a client that disposes without a close (every character switch, Reconnect or unload) is routine.
+            log.LogDebug(ex, "WebSocket closed without completing the handshake key={Key}", session.RegisteredKey);
         }
         catch (Exception ex)
         {
@@ -236,24 +276,48 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             await deadlineCts.CancelAsync();
             await deadline;
             UnregisterSession(session);
+
+            // Also when the abort came while the loop wasn't in a receive (it then just left the loop).
+            if (IsKeepAliveTimeout(socket, session))
+                RecordLimit(_keepAliveRecords, "keepalive_timeout", session);
+
+            // 05-D4: answer a client's close (CloseReceived), and close a socket still open (we're shutting down, or
+            // the loop ended on an error) without waiting on the peer: both bounded by the send timeout. Never the
+            // session's token here, which may be cancelled already.
+            if (socket.State is WebSocketState.CloseReceived or WebSocketState.Open)
+                await session.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
+
             if (socket.State == WebSocketState.CloseSent)
             {
-                // We closed first (refusal or takeover). Read until the client's close so the socket isn't
-                // disposed with its queued frames unread, which can reset the connection and lose our close.
+                // We closed first (refusal, takeover, or just above). Read until the client's close so the socket
+                // isn't disposed with its queued frames unread, which can reset the connection and lose our close.
+                // Bounded by the drain window (and ends at once when ct is cancelled).
                 await DrainUntilPeerCloseAsync(socket, ct);
             }
-            else if (socket.State == WebSocketState.Open)
-            {
-                try
-                {
-                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
-                }
-                catch
-                {
-                    // ignore
-                }
-            }
         }
+    }
+
+    /// <summary>
+    /// 05-D3: whether the framework's keep-alive aborted <paramref name="socket"/> (no pong within the timeout). The
+    /// pending receive then just fails as cancelled, and the abort ends the request too, so neither the exception nor
+    /// the token tells it apart from a shutdown. The socket does: once aborted by the keep-alive, every operation on it
+    /// fails with the keep-alive fault as its inner exception, while an abort by this relay
+    /// (<see cref="ClientSession.AbortedByRelay"/>) or by the connection going away has none. Asking costs nothing: an
+    /// aborted socket refuses a receive without any I/O.
+    /// </summary>
+    private static bool IsKeepAliveTimeout(WebSocket socket, ClientSession session)
+    {
+        if (session.AbortedByRelay || socket.State != WebSocketState.Aborted)
+            return false;
+
+        var probe = socket.ReceiveAsync(Memory<byte>.Empty, CancellationToken.None).AsTask();
+        if (!probe.IsCompleted)
+        {
+            _ = probe.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            return false;
+        }
+
+        return probe.Exception?.InnerException is WebSocketException { InnerException: WebSocketException };
     }
 
     /// <summary>
@@ -506,7 +570,30 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
     private async Task RegisterAsync(ClientSession session, string pairingKey, string? secret, CancellationToken ct)
     {
-        var outcome = DecideRegisterAuth(pairingKey, secret);
+        var (outcome, lostRace) = DecideRegisterAuth(pairingKey, secret, session.FirstBindKey);
+        if (outcome == RegisterAuthOutcome.TryLater)
+        {
+            // 05-D2: no account was created and nothing is mapped, and there's no legacy fallback. The client
+            // reconnects on its normal backoff (never an auth block). Keyed by pairing key; the address is never
+            // recorded or logged. 05-D10: a lost race gets the same refusal and close, recorded as its own reason.
+            if (lostRace)
+            {
+                if (_bindRaceRecords.TryAcquire(pairingKey))
+                {
+                    store.RecordEvent("bind_race", pairingKey: pairingKey);
+                    log.LogInformation("Register refused: a concurrent first bind won, but its account isn't there key={Key}", pairingKey);
+                }
+            }
+            else if (_bindLimitedRecords.TryAcquire(pairingKey))
+            {
+                store.RecordEvent("bind_rate_limited", pairingKey: pairingKey);
+                log.LogInformation("Register refused: too many new accounts from this client address key={Key}", pairingKey);
+            }
+
+            await session.CloseAsync(BindRateLimitedClose, WireCloseReasons.BindRateLimited, ct);
+            return;
+        }
+
         if (outcome == RegisterAuthOutcome.RefuseSilently)
         {
             // No error envelope: old clients print a wind failure for unknown codes. They also retry every
@@ -605,16 +692,23 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         await FlushOutboxAsync(session, ct);
     }
 
-    private RegisterAuthOutcome DecideRegisterAuth(string pairingKey, string? secret)
+    private (RegisterAuthOutcome Outcome, bool LostRace) DecideRegisterAuth(string pairingKey, string? secret, string? firstBindKey)
     {
+        // 05-D2: a slot is taken only for a register that would create the account, and given back when the
+        // insert-if-absent loses the race (or throws), so only real creations count.
+        var lease = default(FirstBindLease);
+        var lostRace = false;
         var outcome = RegisterAuthPolicy.Resolve(
             authMode,
             secret,
             () => store.GetAccountSecretHash(pairingKey),
-            hash => store.TryCreateAccount(pairingKey, hash));
+            hash => store.TryCreateAccount(pairingKey, hash),
+            () => FirstBinds.TryAcquire(firstBindKey, out lease),
+            () => FirstBinds.Refund(lease),
+            () => lostRace = true);
         if (outcome == RegisterAuthOutcome.Authenticated)
             store.TouchAccount(pairingKey);
-        return outcome;
+        return (outcome, lostRace);
     }
 
     /// <summary>
@@ -650,6 +744,13 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             }
 
             await replaced.CloseAsync(WebSocketCloseStatus.PolicyViolation, ErrorCodes.SessionReplaced, timeout.Token);
+
+            // 05-D4: an old session that stopped reading never answers the close, and its loop stays blocked in its
+            // receive (holding its per-IP slot) until something ends it. As at the register deadline, it's aborted once
+            // the drain window has passed.
+            await Task.Delay(CloseDrainTimeout);
+            if (replaced.State != WebSocketState.Closed)
+                replaced.Abort();
         }
         catch (Exception ex)
         {
@@ -1175,8 +1276,18 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (!await RequirePairAsync(session, payload.RequestId, payload.To, MessageTypes.OwnerSettingsQuery, ct))
             return;
 
+        // 05-D1 (a): a query delivered live may get its result routed back. The entry is made before the send (the doll
+        // may answer before the send returns) and withdrawn when it wasn't delivered live; a queued query is matched by
+        // its delivered outbox row instead (05-D1 (b)).
+        var ownerKey = session.PairingKey;
+        var dollKey = payload.To;
+        var requestId = payload.RequestId;
         var forward = Envelope.Create(MessageTypes.OwnerSettingsQuery, payload);
-        await DeliverOrQueueAsync(session, payload.RequestId, payload.To, MessageTypes.OwnerSettingsQuery, forward, OwnerOutboxTtl, ct);
+        await DeliverOrQueueAsync(
+            session, requestId, dollKey, MessageTypes.OwnerSettingsQuery, forward, OwnerOutboxTtl, ct,
+            liveDelivery: string.IsNullOrEmpty(requestId)
+                ? null
+                : (() => SettingsQueries.Add(requestId, ownerKey, dollKey), () => SettingsQueries.Remove(requestId, ownerKey, dollKey)));
     }
 
     private async Task HandleOwnerSettingsUpdateAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -1265,7 +1376,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         Envelope forward,
         TimeSpan ttl,
         CancellationToken ct,
-        Action? onQueueFull = null)
+        Action? onQueueFull = null,
+        (Action Arm, Action Disarm)? liveDelivery = null)
     {
         if (sender.PairingKey is not { } fromKey)
             return;
@@ -1273,8 +1385,10 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (!FitsRouted(fromKey, toKey, msgType, forward))
             return;
 
+        liveDelivery?.Arm();
         if (await TryDeliverAsync(fromKey, toKey, msgType, forward))
             return;
+        liveDelivery?.Disarm();
 
         var queued = Enqueue(requestId, fromKey, toKey, msgType, forward, ttl);
         if (queued == OutboxEnqueueStatus.QuotaFull)
@@ -1535,6 +1649,19 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (!FitsRouted(fromKey, to, envelope.Type, routed))
             return;
 
+        // 05-D1: settings results go only where they were asked for. Matched before the ack below, which then makes a
+        // delivered outbox row single-use, as the in-memory entry is.
+        if (envelope.Type == MessageTypes.OwnerSettingsResult && !IsRequestedSettingsResult(requestId, ownerKey: to, dollKey: fromKey))
+        {
+            if (_unrequestedRecords.TryAcquire(fromKey))
+            {
+                store.RecordEvent("reply_unrequested", pairingKey: fromKey, peerKey: to, msgType: envelope.Type);
+                log.LogInformation("Dropped an unrequested {Type} from key={From} to key={To}", envelope.Type, fromKey, to);
+            }
+
+            return;
+        }
+
         // Only the recipient of a queued message can ack it, and only toward the key that sent it.
         if (!string.IsNullOrEmpty(requestId)
             && envelope.Type is MessageTypes.WindResult or MessageTypes.OwnerSettingsResult or MessageTypes.OwnerSettingsAck
@@ -1545,6 +1672,16 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         await TryDeliverAsync(fromKey, to, envelope.Type, routed);
     }
+
+    /// <summary>
+    /// 05-D1: whether <paramref name="dollKey"/> may send <paramref name="ownerKey"/> an ownerSettingsResult for
+    /// <paramref name="requestId"/>: (a) the relay delivered that query live within the last two minutes (used up here),
+    /// or (b) it delivered it from the outbox within the last ten minutes (05-D13) and no result acked the row yet.
+    /// </summary>
+    private bool IsRequestedSettingsResult(string? requestId, string ownerKey, string dollKey) =>
+        !string.IsNullOrEmpty(requestId)
+        && (SettingsQueries.TryConsume(requestId, ownerKey, dollKey)
+            || store.HasDeliveredRequest(requestId, fromKey: ownerKey, toKey: dollKey, MessageTypes.OwnerSettingsQuery));
 
     /// <summary>The reply re-serialized with <c>from</c> set to the sender and <c>to</c> normalized, or null when unreadable.</summary>
     private static (Envelope Routed, string To, string? RequestId)? Restamp<T>(
@@ -1572,6 +1709,10 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 internal sealed class ClientSession(WebSocket socket, TimeSpan sendTimeout)
 {
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private int _abortedByRelay;
+
+    /// <summary>The connection's client key for the 05-D2 first-bind limit (IPv6 per /48; null: none). Never logged.</summary>
+    public string? FirstBindKey { get; init; }
 
     // Read and written from this session's loop and from other sessions' loops (takeover strips it),
     // so key and auth flag live in one immutable object that is swapped atomically.
@@ -1632,8 +1773,17 @@ internal sealed class ClientSession(WebSocket socket, TimeSpan sendTimeout)
 
     public bool IsOpen => socket.State == WebSocketState.Open;
 
+    public WebSocketState State => socket.State;
+
+    /// <summary>True once this relay aborted the socket itself (<see cref="Abort"/>), as opposed to the keep-alive or the peer.</summary>
+    public bool AbortedByRelay => Volatile.Read(ref _abortedByRelay) != 0;
+
     /// <summary>Drops the connection without a close handshake (for a socket that is stuck).</summary>
-    public void Abort() => socket.Abort();
+    public void Abort()
+    {
+        Volatile.Write(ref _abortedByRelay, 1);
+        socket.Abort();
+    }
 
     /// <summary>
     /// A send on this session's own loop (or from its takeover): bounded by <paramref name="ct"/> and by the send
@@ -1712,6 +1862,7 @@ internal sealed class ClientSession(WebSocket socket, TimeSpan sendTimeout)
     /// Sends a close frame without waiting for the peer's reply, so it is safe while this
     /// session's own loop is blocked in ReceiveAsync. Once the socket has left Open, that loop
     /// stops processing frames and drains until the peer's close (bounded) before disposing.
+    /// After the peer's close (<c>CloseReceived</c>) it sends the answer that completes the handshake (05-D4).
     /// </summary>
     public async Task CloseAsync(WebSocketCloseStatus status, string description, CancellationToken ct)
     {
@@ -1730,13 +1881,13 @@ internal sealed class ClientSession(WebSocket socket, TimeSpan sendTimeout)
 
         try
         {
-            if (socket.State != WebSocketState.Open)
+            if (socket.State is not (WebSocketState.Open or WebSocketState.CloseReceived))
                 return;
             await socket.CloseOutputAsync(status, description, bounded.Token);
         }
-        catch (WebSocketException)
+        catch (Exception ex) when (ex is WebSocketException or IOException or ObjectDisposedException)
         {
-            // Peer already gone.
+            // Peer already gone (05-D4: however the transport reports it).
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {

@@ -154,3 +154,100 @@ internal static class RoutingRules
     public static bool MayRoute(string fromKey, string toKey, Func<bool> hasPair) =>
         string.Equals(fromKey, toKey, StringComparison.Ordinal) || hasPair();
 }
+
+/// <summary>
+/// 05-D1 (a): the <c>ownerSettingsQuery</c>s the relay delivered live, so their <c>ownerSettingsResult</c> may be routed
+/// back. Keyed by (requestId, owner key, doll key), so only the queried doll can answer, only toward the owner who asked,
+/// and only with that requestId. Each entry is used once and expires after <see cref="Ttl"/>. A query queued in the outbox
+/// is matched by its delivered row instead (05-D1 (b)). No sockets, so it can be tested directly. Thread-safe.
+/// <para>
+/// Bounded: at most <c>maxEntries</c>. When full, expired entries go first, then the oldest; every entry has the same
+/// lifetime, so the oldest is the one closest to expiring anyway.
+/// </para>
+/// </summary>
+internal sealed class RequestedReplies(TimeProvider? timeProvider = null, int maxEntries = RequestedReplies.DefaultMaxEntries)
+{
+    public const int DefaultMaxEntries = 16 * 1024;
+
+    /// <summary>How long a live query's result may take. A doll answers a live query at once.</summary>
+    public static readonly TimeSpan Ttl = TimeSpan.FromMinutes(2);
+
+    private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
+    private readonly object _gate = new();
+    private readonly Dictionary<(string RequestId, string Owner, string Doll), DateTimeOffset> _expiries = new();
+
+    // Insertion order (which is expiry order); an entry used or re-added since is skipped when it reaches the front.
+    private readonly Queue<((string RequestId, string Owner, string Doll) Key, DateTimeOffset Expires)> _order = new();
+
+    public int Count
+    {
+        get
+        {
+            lock (_gate)
+                return _expiries.Count;
+        }
+    }
+
+    /// <summary>Records that <paramref name="ownerKey"/>'s query <paramref name="requestId"/> is being delivered to <paramref name="dollKey"/>.</summary>
+    public void Add(string requestId, string ownerKey, string dollKey)
+    {
+        var key = (requestId, ownerKey, dollKey);
+        var now = _time.GetUtcNow();
+        lock (_gate)
+        {
+            DropExpired(now);
+            while (_expiries.Count >= maxEntries && !_expiries.ContainsKey(key) && _order.TryDequeue(out var oldest))
+            {
+                if (_expiries.TryGetValue(oldest.Key, out var expires) && expires == oldest.Expires)
+                    _expiries.Remove(oldest.Key);
+            }
+
+            var expiry = now + Ttl;
+            _expiries[key] = expiry;
+            _order.Enqueue((key, expiry));
+
+            // Entries used early leave stale places behind a live one at the front; keep the queue bounded too.
+            if (_order.Count > 2 * maxEntries)
+            {
+                var live = _expiries.OrderBy(e => e.Value).ToList();
+                _order.Clear();
+                foreach (var (liveKey, liveExpiry) in live)
+                    _order.Enqueue((liveKey, liveExpiry));
+            }
+        }
+    }
+
+    /// <summary>Withdraws an entry whose query wasn't delivered after all.</summary>
+    public void Remove(string requestId, string ownerKey, string dollKey)
+    {
+        lock (_gate)
+            _expiries.Remove((requestId, ownerKey, dollKey));
+    }
+
+    /// <summary>
+    /// True, once, when <paramref name="dollKey"/> may answer <paramref name="ownerKey"/>'s query
+    /// <paramref name="requestId"/>: the entry is removed. False when there's none, or it expired.
+    /// </summary>
+    public bool TryConsume(string requestId, string ownerKey, string dollKey)
+    {
+        var now = _time.GetUtcNow();
+        lock (_gate)
+        {
+            DropExpired(now);
+            return _expiries.Remove((requestId, ownerKey, dollKey), out var expires) && expires > now;
+        }
+    }
+
+    private void DropExpired(DateTimeOffset now)
+    {
+        while (_order.TryPeek(out var front)
+               && (front.Expires <= now
+                   || !_expiries.TryGetValue(front.Key, out var current)
+                   || current != front.Expires))
+        {
+            _order.Dequeue();
+            if (_expiries.TryGetValue(front.Key, out var expires) && expires == front.Expires)
+                _expiries.Remove(front.Key);
+        }
+    }
+}

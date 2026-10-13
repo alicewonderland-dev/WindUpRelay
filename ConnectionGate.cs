@@ -62,19 +62,20 @@ internal sealed class ConnectionGate(int maxConnections, int maxPerClient)
     /// The per-client key of a connection, or null when it gets no per-client cap. A non-loopback peer is the client
     /// itself, and any header is ignored. A loopback peer (tailscaled, or another local proxy) is trusted for
     /// <see cref="ForwardedForHeader"/> (its last entry) only; without a usable one, null, and only the global cap
-    /// applies. IPv6 clients are counted per /64, since one host usually holds a whole /64.
+    /// applies. IPv6 clients are counted per /64, since one host usually holds a whole /64; the first-bind limit groups
+    /// them more widely (<paramref name="ipv6PrefixBits"/>, 05-D7).
     /// </summary>
-    public static string? ClientKey(IPAddress? peer, string? forwardedFor)
+    public static string? ClientKey(IPAddress? peer, string? forwardedFor, int ipv6PrefixBits = 64)
     {
         if (peer is null)
             return null;
         if (peer.IsIPv4MappedToIPv6)
             peer = peer.MapToIPv4();
         if (!IPAddress.IsLoopback(peer))
-            return Bucket(peer);
+            return Bucket(peer, ipv6PrefixBits);
 
         var client = LastForwarded(forwardedFor);
-        return client is null ? null : Bucket(client);
+        return client is null ? null : Bucket(client, ipv6PrefixBits);
     }
 
     /// <summary>
@@ -134,14 +135,21 @@ internal sealed class ConnectionGate(int maxConnections, int maxPerClient)
         return null;
     }
 
-    private static string Bucket(IPAddress address)
+    /// <summary>An IPv4 address as is; an IPv6 address as its /<paramref name="prefixBits"/> network.</summary>
+    private static string Bucket(IPAddress address, int prefixBits)
     {
         if (address.AddressFamily != AddressFamily.InterNetworkV6)
             return address.ToString();
 
+        prefixBits = Math.Clamp(prefixBits, 0, 128);
         var bytes = address.GetAddressBytes();
-        Array.Clear(bytes, 8, 8);
-        return new IPAddress(bytes) + "/64";
+        for (var i = 0; i < bytes.Length; i++)
+        {
+            var keep = Math.Clamp(prefixBits - (i * 8), 0, 8);
+            bytes[i] &= (byte)(0xFF << (8 - keep));
+        }
+
+        return new IPAddress(bytes) + "/" + prefixBits.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private sealed class Slot(ConnectionGate gate, string? clientKey) : IDisposable

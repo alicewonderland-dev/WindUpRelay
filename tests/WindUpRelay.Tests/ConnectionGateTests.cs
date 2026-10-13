@@ -62,6 +62,24 @@ public sealed class ConnectionGateTests
     }
 
     [Fact]
+    public void TheFirstBindKey_GroupsIPv6PerSlash48_AndKeepsIPv4AndTheTrustRules()
+    {
+        // 05-D7: the first-bind limit's key is found the same way, but a whole site (/48) shares it.
+        const int bits = FirstBindLimiter.Ipv6PrefixBits;
+        var a = ConnectionGate.ClientKey(Loopback, "2001:db8:1:2:aaaa::1", bits);
+        var sameSite = ConnectionGate.ClientKey(Loopback, "[2001:db8:1:ffff::2]:443", bits);
+        var otherSite = ConnectionGate.ClientKey(Loopback, "2001:db8:2:2::1", bits);
+        Assert.Equal("2001:db8:1::/48", a);
+        Assert.Equal(a, sameSite);
+        Assert.NotEqual(a, otherSite);
+
+        Assert.Equal("203.0.113.7", ConnectionGate.ClientKey(Loopback, "203.0.113.7", bits));
+        Assert.Equal("203.0.113.7", ConnectionGate.ClientKey(Loopback, "::ffff:203.0.113.7", bits));
+        Assert.Null(ConnectionGate.ClientKey(Loopback, null, bits));
+        Assert.Equal("2001:db8:5::/48", ConnectionGate.ClientKey(IPAddress.Parse("2001:db8:5:6::7"), "203.0.113.7", bits));
+    }
+
+    [Fact]
     public void TheCapPerClient_RefusesOnlyThatClient()
     {
         var gate = new ConnectionGate(maxConnections: 100, maxPerClient: 2);
