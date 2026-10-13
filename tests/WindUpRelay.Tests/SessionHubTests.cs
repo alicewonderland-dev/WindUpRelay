@@ -49,10 +49,15 @@ public sealed partial class SessionHubTests : IDisposable
         }
     }
 
-    private SessionHub NewHub(string mode, TimeSpan? sendTimeout = null) =>
-        new(NullLogger.Instance, _store, 1000, Enum.Parse<RelayAuthMode>(mode))
+    private SessionHub NewHub(
+        string mode,
+        TimeSpan? sendTimeout = null,
+        int maxMessagesPerMinute = 1000,
+        TimeSpan? registerTimeout = null) =>
+        new(NullLogger.Instance, _store, maxMessagesPerMinute, Enum.Parse<RelayAuthMode>(mode))
         {
             SendTimeout = sendTimeout ?? SessionHub.DefaultSendTimeout,
+            RegisterTimeout = registerTimeout ?? WireLimits.RegisterTimeout,
         };
 
     /// <summary>
@@ -144,13 +149,10 @@ public sealed partial class SessionHubTests : IDisposable
         Pair(Key, Peer);
         await Task.Delay(200);
 
-        // Route enough traffic at the stuck session that the relay's send to it blocks (holding its send lock).
-        var filler = new string('x', 32 * 1024);
-        _ = Task.Run(async () =>
-        {
-            for (var i = 0; i < 64; i++)
-                await peer.SendAsync(MessageTypes.Error, new ErrorPayload { To = Key, Code = ErrorCodes.NotAllowed, Message = filler });
-        });
+        // The relay's next send to the stuck session blocks (holding its send lock). 03-D4 caps every field, so this
+        // stalls the connection's writes instead of flooding it with oversized replies.
+        stuck.StallRelayWrites();
+        await peer.SendAsync(MessageTypes.Error, new ErrorPayload { To = Key, Code = ErrorCodes.NotAllowed, Message = "x" });
         await Task.Delay(500);
 
         var started = DateTime.UtcNow;
@@ -172,12 +174,8 @@ public sealed partial class SessionHubTests : IDisposable
         await Task.Delay(200);
 
         // Block the relay's sends to the old session, so its close is stuck and its socket stays open for a while.
-        var filler = new string('x', 32 * 1024);
-        _ = Task.Run(async () =>
-        {
-            for (var i = 0; i < 64; i++)
-                await peer.SendAsync(MessageTypes.Error, new ErrorPayload { To = Key, Code = ErrorCodes.NotAllowed, Message = filler });
-        });
+        stuck.StallRelayWrites();
+        await peer.SendAsync(MessageTypes.Error, new ErrorPayload { To = Key, Code = ErrorCodes.NotAllowed, Message = "x" });
         await Task.Delay(500);
 
         await RegisterOkAsync(hub, Key, secret);
@@ -455,8 +453,18 @@ public sealed partial class SessionHubTests : IDisposable
         /// <summary>Aborts the relay's side of this connection, as the relay does to a stuck replaced session.</summary>
         public void AbortRelaySide() => _serverSocket.Abort();
 
-        /// <summary>Starts reading a client created with <c>reading: false</c>.</summary>
-        public void StartReading() => _ = PumpAsync();
+        /// <summary>
+        /// The relay's writes to this client block from now on, until <see cref="StartReading"/> or the relay aborts the
+        /// socket: a client that stopped reading, whatever its buffers hold.
+        /// </summary>
+        public void StallRelayWrites() => _serverStream.Stall();
+
+        /// <summary>Starts reading a client created with <c>reading: false</c> (and lets stalled relay writes through).</summary>
+        public void StartReading()
+        {
+            _serverStream.Unstall();
+            _ = PumpAsync();
+        }
 
         /// <summary>
         /// <paramref name="reading"/> false never reads from the socket, with small buffers on both ends,
@@ -499,12 +507,35 @@ public sealed partial class SessionHubTests : IDisposable
             await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
+        /// <summary>Sends one binary message.</summary>
+        public async Task SendBinaryAsync(byte[] bytes) =>
+            await _socket.SendAsync(bytes, WebSocketMessageType.Binary, true, CancellationToken.None);
+
         /// <summary>Sends <paramref name="json"/> as one text frame, as is (for payloads a well-behaved client never sends).</summary>
         public async Task SendRawAsync(string json)
         {
             var bytes = Encoding.UTF8.GetBytes(json);
             await _socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
         }
+
+        /// <summary>
+        /// Sends 1 KiB frames of one message that never ends, until <paramref name="ct"/> is cancelled or the connection
+        /// fails (03-D16: the relay must not wait for its end).
+        /// </summary>
+        public Task SendEndlessAsync(WebSocketMessageType type, CancellationToken ct) => Task.Run(async () =>
+        {
+            var frame = new byte[1024];
+            Array.Fill(frame, (byte)'x');
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                    await _socket.SendAsync(frame, type, false, ct);
+            }
+            catch (Exception ex) when (ex is WebSocketException or IOException or ObjectDisposedException or OperationCanceledException)
+            {
+                // The relay dropped the connection, or the test stopped sending.
+            }
+        });
 
         public async Task CloseOutputAsync()
         {
@@ -607,11 +638,26 @@ public sealed partial class SessionHubTests : IDisposable
         }
     }
 
-    /// <summary>The relay's side of a test connection, whose writes can be made to fail (before any byte is written).</summary>
+    /// <summary>
+    /// The relay's side of a test connection, whose writes can be made to fail (before any byte is written), or to
+    /// stall until released, cancelled or the stream is disposed (as the relay's abort does).
+    /// </summary>
     private sealed class BreakableStream(Stream inner) : Stream
     {
         private int _skip;
         private int _fail;
+        private TaskCompletionSource? _stall;
+
+        public void Stall() =>
+            Interlocked.CompareExchange(ref _stall, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), null);
+
+        public void Unstall() => Interlocked.Exchange(ref _stall, null)?.TrySetResult();
+
+        private async Task WaitIfStalledAsync(CancellationToken ct)
+        {
+            if (Volatile.Read(ref _stall) is { } stall)
+                await stall.Task.WaitAsync(ct);
+        }
 
         public void Break(int count, int skip)
         {
@@ -645,25 +691,32 @@ public sealed partial class SessionHubTests : IDisposable
         public override void Write(byte[] buffer, int offset, int count)
         {
             ThrowIfBroken();
+            WaitIfStalledAsync(CancellationToken.None).GetAwaiter().GetResult();
             inner.Write(buffer, offset, count);
         }
 
-        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
         {
             ThrowIfBroken();
-            return inner.WriteAsync(buffer, ct);
+            await WaitIfStalledAsync(ct);
+            await inner.WriteAsync(buffer, ct);
         }
 
-        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
         {
             ThrowIfBroken();
-            return inner.WriteAsync(buffer, offset, count, ct);
+            await WaitIfStalledAsync(ct);
+            await inner.WriteAsync(buffer.AsMemory(offset, count), ct);
         }
 
         protected override void Dispose(bool disposing)
         {
             if (disposing)
+            {
+                Interlocked.Exchange(ref _stall, null)?.TrySetException(new ObjectDisposedException(nameof(BreakableStream)));
                 inner.Dispose();
+            }
+
             base.Dispose(disposing);
         }
     }

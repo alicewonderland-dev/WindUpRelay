@@ -38,6 +38,14 @@ var dbPath = string.IsNullOrWhiteSpace(dbPathConfig)
 var maxMessagesPerMinute = int.TryParse(builder.Configuration["Relay:MaxMessagesPerMinute"], out var mpm)
     ? Math.Clamp(mpm, 10, 10_000)
     : 120;
+// 03-D9: a global cap on open WebSocket connections (also Kestrel's upgraded-connection limit), and a cap per client
+// address taken from the Funnel header (see ConnectionGate).
+var maxConnections = int.TryParse(builder.Configuration["Relay:MaxConnections"], out var mc)
+    ? Math.Clamp(mc, 1, 100_000)
+    : 1000;
+var maxConnectionsPerIp = int.TryParse(builder.Configuration["Relay:MaxConnectionsPerIp"], out var mpi)
+    ? Math.Clamp(mpi, 1, 100_000)
+    : 16;
 
 if (resetAccountKey is not null)
 {
@@ -52,6 +60,7 @@ if (!RegisterAuthPolicy.TryParseMode(builder.Configuration["Relay:AuthMode"], ou
 }
 
 builder.WebHost.UseUrls(urls);
+RelayWebSocketEndpoint.LimitUpgradedConnections(builder.WebHost, maxConnections);
 
 var app = builder.Build();
 var log = app.Logger;
@@ -81,12 +90,13 @@ var deletedStamps = store.DeleteFutureSyncStamps(DateTimeOffset.UtcNow);
 log.LogInformation("Startup cleanup: {Count} future-stamped consent/wind row(s) deleted", deletedStamps);
 
 var sessions = new SessionHub(log, store, maxMessagesPerMinute, authMode);
+var endpoint = new RelayWebSocketEndpoint(relayToken, sessions, new ConnectionGate(maxConnections, maxConnectionsPerIp), log);
 
 app.UseWebSockets();
 app.MapGet("/", () => Results.Text("WindUpKey relay. Connect plugins to /ws"));
 app.MapGet("/stats", (HttpContext context) =>
 {
-    if (!IsAuthorized(context, relayToken))
+    if (!RelayWebSocketEndpoint.IsAuthorized(context, relayToken))
         return Results.Unauthorized();
 
     var online = sessions.OnlineCount;
@@ -105,34 +115,12 @@ app.MapGet("/stats", (HttpContext context) =>
         accountsClaimedLast24h = stats.AccountsClaimedLast24h,
     });
 });
-app.Map("/ws", async (HttpContext context) =>
-{
-    if (!context.WebSockets.IsWebSocketRequest)
-    {
-        context.Response.StatusCode = StatusCodes.Status400BadRequest;
-        return;
-    }
+app.Map("/ws", (RequestDelegate)endpoint.HandleAsync);
 
-    if (!IsAuthorized(context, relayToken))
-    {
-        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-        return;
-    }
-
-    using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    await sessions.HandleClientAsync(socket, context.RequestAborted);
-});
-
-log.LogInformation("WindUpKey relay listening on {Urls}; database={Db}; authMode={AuthMode}", urls, dbPath, authMode);
+log.LogInformation(
+    "WindUpKey relay listening on {Urls}; database={Db}; authMode={AuthMode}; maxConnections={Max}; maxConnectionsPerIp={PerIp}",
+    urls, dbPath, authMode, maxConnections, maxConnectionsPerIp);
 app.Run();
-
-static bool IsAuthorized(HttpContext context, string relayToken)
-{
-    var provided = RelayTokenAuth.GetProvidedToken(
-        context.Request.Query["token"].FirstOrDefault(),
-        context.Request.Headers.Authorization.FirstOrDefault());
-    return RelayTokenAuth.IsAuthorized(provided, relayToken);
-}
 
 internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesPerMinute, RelayAuthMode authMode)
 {
@@ -143,10 +131,16 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     private static readonly TimeSpan RefusalRecordWindow = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan ReplacedCloseTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan CloseDrainTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan RegisterInFlightPoll = TimeSpan.FromMilliseconds(100);
     internal static readonly TimeSpan DefaultSendTimeout = TimeSpan.FromSeconds(5);
+    private const int FlushBatchRows = 50;
+    private const int FlushBatches = 20;
 
     /// <summary>Close description when a connection registers a second, different key (relay-only, never an error envelope).</summary>
     internal const string OneKeyPerConnection = "one_key_per_connection";
+
+    /// <summary>What events record for a client's message type that isn't a known one (03-D7).</summary>
+    internal const string UnknownMsgType = "unknown";
 
     private readonly ConcurrentDictionary<string, ClientSession> _byPairingKey =
         new(StringComparer.Ordinal);
@@ -158,42 +152,75 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
     /// </summary>
     internal TimeSpan SendTimeout { get; init; } = DefaultSendTimeout;
 
+    /// <summary>
+    /// How long a connection has to register (03-D3). A registered or displaced session is never closed by it.
+    /// Settable for tests.
+    /// </summary>
+    internal TimeSpan RegisterTimeout { get; init; } = WireLimits.RegisterTimeout;
+
     private readonly PerKeyThrottle _refusalRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _keySwitchRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _authFailureRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _notPairedRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _futureStampRecords = new(RefusalRecordWindow);
     private readonly PerKeyThrottle _malformedRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _rateLimitedRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _tooBigRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _binaryRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _registerTimeoutRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _registerRequiredRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _routedTooBigRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _queueFullRecords = new(RefusalRecordWindow);
+    private readonly PerKeyThrottle _outboxRowRecords = new(RefusalRecordWindow);
 
     public int OnlineCount => _byPairingKey.Count(kv => kv.Value.IsOpen);
 
     public async Task HandleClientAsync(WebSocket socket, CancellationToken ct)
     {
         var session = new ClientSession(socket, SendTimeout);
+        using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var deadline = EnforceRegisterDeadlineAsync(session, socket, deadlineCts.Token);
         try
         {
-            var buffer = new byte[16 * 1024];
+            // 03-D16: an oversized or binary message is closed on as soon as it's known, not read to its end.
+            var reader = new BoundedMessageReader(stopAtLimit: true);
+            var beforeRegister = 0;
             while (socket.State == WebSocketState.Open && !ct.IsCancellationRequested)
             {
-                var result = await socket.ReceiveAsync(buffer, ct);
-                if (result.MessageType == WebSocketMessageType.Close)
+                // 03-D2: by RegisteredKey, not PairingKey: a displaced session has no PairingKey but did register.
+                var registered = session.RegisteredKey is not null;
+                var message = await reader.ReadAsync(
+                    socket, registered ? WireLimits.RelayMessageBytes : WireLimits.PreRegisterMessageBytes, ct);
+                if (message.Kind == WireMessageKind.Close)
                     break;
 
-                if (result.MessageType != WebSocketMessageType.Text)
-                    continue;
-
-                var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                while (!result.EndOfMessage)
-                {
-                    result = await socket.ReceiveAsync(buffer, ct);
-                    json += Encoding.UTF8.GetString(buffer, 0, result.Count);
-                }
-
-                // Once this session has been closed (refused or replaced), ignore whatever the client still sends.
+                // Once this session has been closed (refused, replaced or past its deadline), ignore what the client still sends.
                 if (socket.State != WebSocketState.Open)
                     break;
 
-                await ProcessMessageAsync(session, json, ct);
+                if (message.Kind == WireMessageKind.Oversized)
+                {
+                    RecordLimit(_tooBigRecords, "message_too_big", session);
+                    await session.CloseAsync(WebSocketCloseStatus.MessageTooBig, WireCloseReasons.MessageTooBig, ct);
+                    break;
+                }
+
+                if (message.Kind == WireMessageKind.Binary)
+                {
+                    RecordLimit(_binaryRecords, "binary_message", session);
+                    await session.CloseAsync(WebSocketCloseStatus.InvalidMessageType, WireCloseReasons.BinaryNotSupported, ct);
+                    break;
+                }
+
+                // 03-D3: a few messages to register in, pings included; old clients send their register first.
+                if (!registered && ++beforeRegister > WireLimits.PreRegisterMessages)
+                {
+                    RecordLimit(_registerRequiredRecords, "register_required", session);
+                    await session.CloseAsync(WebSocketCloseStatus.PolicyViolation, WireCloseReasons.RegisterRequired, ct);
+                    break;
+                }
+
+                await ProcessMessageAsync(session, message.Text!, ct);
             }
         }
         catch (OperationCanceledException)
@@ -206,6 +233,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
         finally
         {
+            await deadlineCts.CancelAsync();
+            await deadline;
             UnregisterSession(session);
             if (socket.State == WebSocketState.CloseSent)
             {
@@ -226,6 +255,56 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             }
         }
     }
+
+    /// <summary>
+    /// 03-D3: closes a connection that hasn't registered within <see cref="RegisterTimeout"/>, and aborts it if the peer
+    /// doesn't answer the close within the drain window (its loop may be blocked in a receive). A session that has
+    /// registered, or is registering, is left alone, displaced or not. Ends quietly when <paramref name="ct"/> is
+    /// cancelled (the session ended).
+    /// </summary>
+    private async Task EnforceRegisterDeadlineAsync(ClientSession session, WebSocket socket, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(RegisterTimeout, ct);
+
+            // 03-D18: a register in flight is waited for; one that fails (a legacy key collision) leaves the session to
+            // the deadline again.
+            while (!session.TryExpireRegister())
+            {
+                if (session.RegisteredKey is not null)
+                    return;
+                await Task.Delay(RegisterInFlightPoll, ct);
+            }
+
+            RecordLimit(_registerTimeoutRecords, "register_timeout", session);
+            await session.CloseAsync(WebSocketCloseStatus.PolicyViolation, WireCloseReasons.RegisterTimeout, ct);
+            await Task.Delay(CloseDrainTimeout, ct);
+            if (socket.State != WebSocketState.Closed)
+                session.Abort();
+        }
+        catch (OperationCanceledException)
+        {
+            // The session ended first.
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug(ex, "Register deadline failed");
+        }
+    }
+
+    /// <summary>Records a limit event (03-D7: every 03 event is throttled), keyed by the registered key or, before register, one shared slot.</summary>
+    private void RecordLimit(PerKeyThrottle throttle, string kind, ClientSession session, string? msgType = null)
+    {
+        var key = session.RegisteredKey;
+        if (!throttle.TryAcquire(key ?? string.Empty))
+            return;
+        store.RecordEvent(kind, pairingKey: key, msgType: msgType);
+        log.LogInformation("Relay limit: {Kind} key={Key}", kind, key ?? "(unregistered)");
+    }
+
+    /// <summary>A client's message type as events record it: a known <see cref="MessageTypes"/> constant, or "unknown" (03-D7).</summary>
+    private static string EventMsgType(string? type) => MessageTypes.IsKnown(type) ? type! : UnknownMsgType;
 
     private static async Task DrainUntilPeerCloseAsync(WebSocket socket, CancellationToken ct)
     {
@@ -264,11 +343,14 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (envelope is null)
             return;
 
-        if (session.PairingKey is not null
-            && envelope.Type is not (MessageTypes.Ping or MessageTypes.Pong or MessageTypes.Register)
-            && !store.TryConsumeRate(session.PairingKey, maxMessagesPerMinute))
+        // 03-D8: a re-register counts too (one key per connection still holds); only pings and pongs are exempt.
+        if (session.PairingKey is { } rateKey
+            && envelope.Type is not (MessageTypes.Ping or MessageTypes.Pong)
+            && !store.TryConsumeRate(rateKey, maxMessagesPerMinute))
         {
-            store.RecordEvent("rate_limited", pairingKey: session.PairingKey, msgType: envelope.Type);
+            // 03-D7: recorded at most once per key per window, and only with a known message type.
+            if (_rateLimitedRecords.TryAcquire(rateKey))
+                store.RecordEvent("rate_limited", pairingKey: rateKey, msgType: EventMsgType(envelope.Type));
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
                 Code = ErrorCodes.RateLimited,
@@ -288,18 +370,31 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
     }
 
-    /// <summary>A client sending broken payloads may do so on every message: record and log at most once per key per window.</summary>
+    /// <summary>
+    /// A client sending broken (or, 03-D4, over-limit) payloads may do so on every message: record and log at most once
+    /// per key per window.
+    /// </summary>
     private void RecordMalformed(ClientSession session, string msgType)
     {
         var key = session.PairingKey;
         if (!_malformedRecords.TryAcquire(key ?? string.Empty))
             return;
-        store.RecordEvent("payload_malformed", pairingKey: key, msgType: msgType);
-        log.LogInformation("Dropped a {Type} with an unreadable payload key={Key}", msgType, key);
+        store.RecordEvent("payload_malformed", pairingKey: key, msgType: EventMsgType(msgType));
+        log.LogInformation("Dropped a {Type} with an unreadable or over-limit payload key={Key}", EventMsgType(msgType), key);
     }
 
     private async Task DispatchAsync(ClientSession session, Envelope envelope, CancellationToken ct)
     {
+        // 03-D4: a field over its limit makes the payload malformed. It's dropped with no reply, before anything could
+        // echo it (bad_request, not_allowed) or forward, queue or store it. 01-D7 still comes first: a routed relay-only
+        // error is dropped silently by RouteReplyAsync, whatever else it holds. Past this point a payload's key fields
+        // are keys, so handlers don't check them for blanks again (03-D18).
+        if (!IsRelayOnlyError(envelope) && !WireLimits.IsValidPayload(envelope.Type, envelope.Payload))
+        {
+            RecordMalformed(session, envelope.Type);
+            return;
+        }
+
         switch (envelope.Type)
         {
             case MessageTypes.Register:
@@ -363,6 +458,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
     }
 
+    private static bool IsRelayOnlyError(Envelope envelope) =>
+        envelope.Type == MessageTypes.Error && ErrorCodes.IsRelayOnly(envelope.GetPayload<ErrorPayload>()?.Code);
+
     private async Task HandleRegisterAsync(ClientSession session, Envelope envelope, CancellationToken ct)
     {
         var payload = envelope.GetPayload<RegisterPayload>();
@@ -392,7 +490,23 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
         }
 
-        var outcome = DecideRegisterAuth(pairingKey, payload?.Secret);
+        // 03-D18: claim the connection from the register deadline before the auth decision (which may create an
+        // account), so a session the deadline closed never claims or displaces a key.
+        if (!session.TryBeginRegister())
+            return;
+        try
+        {
+            await RegisterAsync(session, pairingKey, payload?.Secret, ct);
+        }
+        finally
+        {
+            session.EndFailedRegister();
+        }
+    }
+
+    private async Task RegisterAsync(ClientSession session, string pairingKey, string? secret, CancellationToken ct)
+    {
+        var outcome = DecideRegisterAuth(pairingKey, secret);
         if (outcome == RegisterAuthOutcome.RefuseSilently)
         {
             // No error envelope: old clients print a wind failure for unknown codes. They also retry every
@@ -724,8 +838,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (await TryDeliverAsync(peerKey, toKey, MessageTypes.PairEstablished, envelope))
             return;
 
-        store.EnqueueOutbox(null, peerKey, toKey, MessageTypes.PairEstablished, envelope.Serialize(), PairOutboxTtl);
-        store.RecordEvent("queue", pairingKey: peerKey, peerKey: toKey, msgType: MessageTypes.PairEstablished);
+        // 03-D6: exempt from the quotas, like the removal notices.
+        Enqueue(null, peerKey, toKey, MessageTypes.PairEstablished, envelope, PairOutboxTtl);
     }
 
     private async Task HandlePairRemoveAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -759,7 +873,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         if (!removal.Removed)
             return;
 
-        store.EnqueueOutboxOnce(null, session.PairingKey, peerKey, MessageTypes.PairRemove, notify.Serialize(), PairOutboxTtl);
+        Enqueue(null, session.PairingKey, peerKey, MessageTypes.PairRemove, notify, PairOutboxTtl, once: true);
     }
 
     private async Task HandlePresenceQueryAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -775,7 +889,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<PresenceQueryPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To))
+        if (payload is null)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -794,8 +908,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         var online = false;
         if (MayRoute(session.PairingKey, payload.To))
         {
-            online = await TryDeliverAsync(
-                session.PairingKey, payload.To, MessageTypes.PresenceQuery, Envelope.Create(MessageTypes.PresenceQuery, payload));
+            var forward = Envelope.Create(MessageTypes.PresenceQuery, payload);
+            online = FitsRouted(session.PairingKey, payload.To, MessageTypes.PresenceQuery, forward)
+                     && await TryDeliverAsync(session.PairingKey, payload.To, MessageTypes.PresenceQuery, forward);
         }
         else
         {
@@ -824,7 +939,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<WindPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To) || payload.Hours <= 0)
+        if (payload is null || payload.Hours <= 0)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -857,7 +972,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<UnwindPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To))
+        if (payload is null)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -892,7 +1007,6 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         var payload = envelope.GetPayload<WindRequestPayload>();
         if (payload is null
             || string.IsNullOrWhiteSpace(payload.RequestId)
-            || string.IsNullOrWhiteSpace(payload.To)
             || payload.PercentRemaining is < 0 or > 100)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
@@ -917,7 +1031,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
         }
 
-        if (!store.TryConsumeWindRequest(session.PairingKey, WindRequestCooldown))
+        if (!store.TryConsumeWindRequest(session.PairingKey, WindRequestCooldown, out var cooldown))
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -928,6 +1042,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
         }
 
+        // 03-D18: a request the recipient's full queue refused (queue_full) doesn't use up the hourly cooldown.
         var forward = Envelope.Create(MessageTypes.WindRequest, payload);
         await DeliverOrQueueAsync(
             session,
@@ -936,7 +1051,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             MessageTypes.WindRequest,
             forward,
             WindOutboxTtl,
-            ct);
+            ct,
+            onQueueFull: () => store.RefundWindRequest(cooldown));
     }
 
     private async Task HandleOwnerGrantAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -952,7 +1068,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<OwnerGrantPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To))
+        if (payload is null)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -970,13 +1086,16 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
 
         var identity = payload.Identity;
         var live = Envelope.Create(MessageTypes.OwnerGrant, payload);
+        if (!FitsRouted(session.PairingKey, payload.To, MessageTypes.OwnerGrant, live))
+            return;
         if (await TryDeliverAsync(session.PairingKey, payload.To, MessageTypes.OwnerGrant, live))
             return;
 
+        // 03-D6: a doll re-sends its grants on every connect, so at most one waits per doll and owner (a later revoke
+        // still deletes it, 02-D31). It has no requestId, so a full queue only records an event.
         payload.Identity = null;
         var queued = Envelope.Create(MessageTypes.OwnerGrant, payload);
-        store.EnqueueOutbox(null, session.PairingKey, payload.To, MessageTypes.OwnerGrant, queued.Serialize(), OwnerOutboxTtl);
-        store.RecordEvent("queue", pairingKey: session.PairingKey, peerKey: payload.To, msgType: MessageTypes.OwnerGrant);
+        Enqueue(null, session.PairingKey, payload.To, MessageTypes.OwnerGrant, queued, OwnerOutboxTtl, once: true);
         _ = identity; // local label is live-only; offline recipients restore without Name@World
     }
 
@@ -993,7 +1112,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<OwnerRevokedPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To))
+        if (payload is null)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -1015,15 +1134,16 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var forward = Envelope.Create(MessageTypes.OwnerRevoked, payload);
+        if (!FitsRouted(session.PairingKey, payload.To, MessageTypes.OwnerRevoked, forward))
+            return;
         if (await TryDeliverAsync(session.PairingKey, payload.To, MessageTypes.OwnerRevoked, forward))
             return;
 
         // 02-D29: at most one pending copy per sender and recipient. RemovePair keeps it, so the pairRemove that
         // usually follows doesn't drop it. 02-D31: the grants queued before it go, so none is delivered after it.
-        var queued = store.EnqueueOutboxOnce(null, session.PairingKey, payload.To, MessageTypes.OwnerRevoked,
-            forward.Serialize(), OwnerOutboxTtl, supersedes: MessageTypes.OwnerGrant);
-        if (queued is not null)
-            store.RecordEvent("queue", pairingKey: session.PairingKey, peerKey: payload.To, msgType: MessageTypes.OwnerRevoked);
+        // 03-D6: exempt from the quotas, so a revoke is never lost to a full queue.
+        Enqueue(null, session.PairingKey, payload.To, MessageTypes.OwnerRevoked, forward, OwnerOutboxTtl, once: true,
+            supersedes: MessageTypes.OwnerGrant);
     }
 
     private async Task HandleOwnerSettingsQueryAsync(ClientSession session, Envelope envelope, CancellationToken ct)
@@ -1039,7 +1159,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<OwnerSettingsQueryPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To))
+        if (payload is null)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -1072,7 +1192,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<OwnerSettingsUpdatePayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To))
+        if (payload is null)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -1106,7 +1226,7 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         }
 
         var payload = envelope.GetPayload<CallPayload>();
-        if (payload is null || string.IsNullOrWhiteSpace(payload.To) || payload.WorldId == 0 || payload.TerritoryId == 0)
+        if (payload is null || payload.WorldId == 0 || payload.TerritoryId == 0)
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
@@ -1123,6 +1243,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
 
         var forward = Envelope.Create(MessageTypes.Call, payload);
+        if (!FitsRouted(session.PairingKey, payload.To, MessageTypes.Call, forward))
+            return;
         if (await TryDeliverAsync(session.PairingKey, payload.To, MessageTypes.Call, forward))
             return;
 
@@ -1142,18 +1264,25 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         string msgType,
         Envelope forward,
         TimeSpan ttl,
-        CancellationToken ct)
+        CancellationToken ct,
+        Action? onQueueFull = null)
     {
-        if (sender.PairingKey is null)
+        if (sender.PairingKey is not { } fromKey)
             return;
 
-        if (await TryDeliverAsync(sender.PairingKey, toKey, msgType, forward))
+        if (!FitsRouted(fromKey, toKey, msgType, forward))
             return;
 
-        store.EnqueueOutbox(requestId, sender.PairingKey, toKey, msgType, forward.Serialize(), ttl);
-        store.RecordEvent("queue", pairingKey: sender.PairingKey, peerKey: toKey, msgType: msgType);
+        if (await TryDeliverAsync(fromKey, toKey, msgType, forward))
+            return;
 
-        if (!string.IsNullOrEmpty(requestId))
+        var queued = Enqueue(requestId, fromKey, toKey, msgType, forward, ttl);
+        if (queued == OutboxEnqueueStatus.QuotaFull)
+            onQueueFull?.Invoke();
+        if (string.IsNullOrEmpty(requestId))
+            return;
+
+        if (queued == OutboxEnqueueStatus.Queued)
         {
             await sender.SendAsync(Envelope.Create(MessageTypes.DeliveryQueued, new DeliveryStatusPayload
             {
@@ -1162,6 +1291,70 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                 Type = msgType,
             }), ct);
         }
+        else if (queued == OutboxEnqueueStatus.QuotaFull)
+        {
+            // 03-D6: the newest message is the one refused, and the sender is told (queue_full isn't relay-only).
+            await sender.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
+            {
+                RequestId = requestId,
+                To = fromKey,
+                Code = ErrorCodes.QueueFull,
+                Message = "That partner's message queue is full; try again later.",
+            }), ct);
+        }
+    }
+
+    /// <summary>
+    /// Queues <paramref name="envelope"/> for offline <paramref name="toKey"/> within the 03-D6 limits (row size, quotas,
+    /// and with <paramref name="once"/> at most one pending of the type per sender and recipient), and records what
+    /// happened. A full queue or an oversized row is recorded at most once per sender per window.
+    /// </summary>
+    private OutboxEnqueueStatus Enqueue(
+        string? requestId,
+        string fromKey,
+        string toKey,
+        string msgType,
+        Envelope envelope,
+        TimeSpan ttl,
+        bool once = false,
+        string? supersedes = null)
+    {
+        var result = store.TryEnqueueOutbox(requestId, fromKey, toKey, msgType, envelope.Serialize(), ttl, once, supersedes);
+        switch (result)
+        {
+            case OutboxEnqueueStatus.Queued:
+                store.RecordEvent("queue", pairingKey: fromKey, peerKey: toKey, msgType: msgType);
+                break;
+            case OutboxEnqueueStatus.QuotaFull when _queueFullRecords.TryAcquire(fromKey):
+                store.RecordEvent("queue_full", pairingKey: fromKey, peerKey: toKey, msgType: msgType);
+                log.LogInformation("Outbox full for key={To}; refused a {Type} from key={From}", toKey, msgType, fromKey);
+                break;
+            case OutboxEnqueueStatus.RowTooBig when _outboxRowRecords.TryAcquire(fromKey):
+                store.RecordEvent("outbox_row_too_big", pairingKey: fromKey, peerKey: toKey, msgType: msgType);
+                break;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 03-D5: whether an envelope built from a client's data is small enough to route, after re-serialisation (escaping
+    /// can grow text up to six times). Otherwise it's dropped, neither delivered nor queued, and recorded at most once
+    /// per sender per window. The largest routed message then takes about a second at 0.5 Mbit/s, well inside the send
+    /// timeout, so a partner can't use one to get the recipient aborted.
+    /// </summary>
+    private bool FitsRouted(string fromKey, string toKey, string msgType, Envelope routed)
+    {
+        if (Encoding.UTF8.GetByteCount(routed.Serialize()) <= WireLimits.RoutedMessageBytes)
+            return true;
+
+        if (_routedTooBigRecords.TryAcquire(fromKey))
+        {
+            store.RecordEvent("routed_too_big", pairingKey: fromKey, peerKey: toKey, msgType: msgType);
+            log.LogInformation("Dropped a {Type} from key={From} to key={To}: too big once re-serialised", msgType, fromKey, toKey);
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1229,7 +1422,22 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
 
         store.ExpirePending();
-        foreach (var row in store.TakePendingFor(key))
+
+        // 03-D6: batches in id order until the outbox is empty or a send fails, at most FlushBatches per register.
+        for (var batch = 0; batch < FlushBatches; batch++)
+        {
+            var rows = store.TakePendingFor(key, FlushBatchRows);
+            if (rows.Count == 0)
+                return;
+            if (!await FlushRowsAsync(session, key, rows, ct))
+                return;
+        }
+    }
+
+    /// <summary>Delivers one batch of queued rows in order. False when a send failed: the rest stays pending.</summary>
+    private async Task<bool> FlushRowsAsync(ClientSession session, string key, IReadOnlyList<OutboxRow> rows, CancellationToken ct)
+    {
+        foreach (var row in rows)
         {
             var envelope = Envelope.TryParse(row.EnvelopeJson);
             if (envelope is null)
@@ -1246,11 +1454,18 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                 continue;
             }
 
+            // 03-D5: a row queued before these limits (by an older relay) may be too big to route now.
+            if (!FitsRouted(row.FromKey, key, row.MsgType, envelope))
+            {
+                store.MarkExpired(row.Id);
+                continue;
+            }
+
             // Delivered only when the frame was actually sent; the rest stays pending for the next register.
             if (!await session.SendAsync(envelope, ct))
             {
                 store.RecordEvent("send_failed", pairingKey: row.FromKey, peerKey: key, msgType: row.MsgType);
-                break;
+                return false;
             }
 
             store.MarkDelivered(row.Id);
@@ -1268,6 +1483,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
                     Type = row.MsgType,
                 }));
         }
+
+        return true;
     }
 
     /// <summary>
@@ -1315,6 +1532,9 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
             return;
         }
 
+        if (!FitsRouted(fromKey, to, envelope.Type, routed))
+            return;
+
         // Only the recipient of a queued message can ack it, and only toward the key that sent it.
         if (!string.IsNullOrEmpty(requestId)
             && envelope.Type is MessageTypes.WindResult or MessageTypes.OwnerSettingsResult or MessageTypes.OwnerSettingsAck
@@ -1344,13 +1564,8 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         return (Envelope.Create(envelope.Type, payload), to, getRequestId(payload));
     }
 
-    internal static string NormalizePairingKey(string? key)
-    {
-        if (string.IsNullOrWhiteSpace(key))
-            return string.Empty;
-        var chars = key.Trim().ToUpperInvariant().Where(char.IsAsciiLetterOrDigit).ToArray();
-        return new string(chars);
-    }
+    /// <summary>The same normalisation the 03-D4 key checks use.</summary>
+    internal static string NormalizePairingKey(string? key) => WireLimits.NormalizeKey(key);
 }
 
 /// <param name="sendTimeout">How long any one send may take (see <see cref="SessionHub.SendTimeout"/>).</param>
@@ -1386,6 +1601,34 @@ internal sealed class ClientSession(WebSocket socket, TimeSpan sendTimeout)
         ReferenceEquals(Interlocked.CompareExchange(ref _identity, value, expected), expected);
 
     public void MarkRegistered(string pairingKey) => Interlocked.CompareExchange(ref _registeredKey, pairingKey, null);
+
+    // 03-D18: who has this connection before register, the register deadline or a register in flight; whichever
+    // claims it first wins, so a deadline-closed session never claims or displaces a key.
+    private const int Waiting = 0;
+    private const int Registering = 1;
+    private const int TimedOut = 2;
+    private int _registerPhase;
+
+    /// <summary>
+    /// Called by a register before its auth decision. False once the register deadline has closed this connection: the
+    /// register must stop. A connection that registered before stays <c>Registering</c>.
+    /// </summary>
+    public bool TryBeginRegister() =>
+        Interlocked.CompareExchange(ref _registerPhase, Registering, Waiting) != TimedOut;
+
+    /// <summary>Ends a register attempt that didn't register, so the deadline applies again.</summary>
+    public void EndFailedRegister()
+    {
+        if (RegisteredKey is null)
+            Interlocked.CompareExchange(ref _registerPhase, Waiting, Registering);
+    }
+
+    /// <summary>
+    /// Called by the register deadline. True when no register has begun: the connection is the deadline's to close,
+    /// and any later register stops. False while a register is in flight or after one succeeded.
+    /// </summary>
+    public bool TryExpireRegister() =>
+        Interlocked.CompareExchange(ref _registerPhase, TimedOut, Waiting) == Waiting;
 
     public bool IsOpen => socket.State == WebSocketState.Open;
 

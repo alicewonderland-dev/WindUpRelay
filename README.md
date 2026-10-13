@@ -164,3 +164,71 @@ only after both of them have connected to it once. Nobody needs to pair again.
 it, as for relay identity above. The protection against forged replies (`from`) and against
 messages between keys that aren't paired lives in the relay: a new plugin on an old relay still
 works, but isn't protected.
+
+## Message and resource limits
+
+All limits live in `WireLimits` in the shared protocol project, so relay, plugin and tests use the
+same numbers. Message sizes count UTF-8 bytes per WebSocket message (all frames up to the end of
+the message); field lengths count characters (UTF-16 code units) after JSON unescaping.
+
+**Messages.** A connection may send messages of up to 4 KiB until it has registered, and up to
+64 KiB after. A bigger message is closed with `1009` / `message_too_big` as soon as it crosses the
+limit, without waiting for the rest of it, and a binary message with `1003` / `binary_not_supported`
+at its first frame. Legitimate traffic stays far below this: the largest message an old
+client sends is about 16 KB (owner settings with every emote), and a register is under 300 bytes.
+
+**Before register.** A connection has 10 seconds to register, and may send at most 8 messages
+(pings included) before it does. Otherwise it's closed with `1008` / `register_timeout` or
+`1008` / `register_required`, and dropped if it doesn't answer the close within 2 seconds. A
+session that has registered is never closed by the deadline, even after another session took its
+key over. Re-registering on a connection counts against `Relay:MaxMessagesPerMinute` like any other
+message (only pings and pongs don't).
+
+**Fields.** Every payload the relay forwards, routes, queues or stores is checked first. Any of these
+over its limit makes the whole message malformed: it's dropped with no reply (`payload_malformed`),
+so nothing is echoed back. Nothing is truncated.
+
+| Field | Limit |
+|---|---|
+| `requestId`, `code`, `status`, timestamps, `identity`, `worldName`, emote `name`, `remainingDisplay` | 64 |
+| `message` | 256 |
+| `emotes`, `dollStatePush.peers` | 512 entries |
+| `to`, `from` (when given), `peerKey`, `myKey`, `theirKey` | must normalise to an 8-character key |
+
+**Routed messages.** A message the relay builds from a client's data (a forward, a rebuilt reply, a
+queued message) is dropped (`routed_too_big`) if it is over 64 KiB once re-serialised. JSON
+escaping can make text up to six times bigger (`<`, `&`, `+` and non-ASCII are escaped). The relay's
+own messages (`pairSync`, delivery status, relay errors) are exempt.
+
+**Outbox.** A queued message may be at most 4 KiB. At most 100 messages from one sender to one
+recipient, and 1000 for one recipient, wait at a time. When a quota is full, the new message isn't
+queued (`queue_full`), and a sender whose message had a request ID gets an `error` with code
+`queue_full` (old plugins show their generic failure, new ones say the partner's queue is full).
+`ownerRevoked`, `pairRemove` and `pairEstablished` are exempt from the quotas, so a removal is never
+lost, and at most one `ownerGrant` waits per doll and owner (a later `ownerRevoked` still deletes
+it). On register, the relay delivers queued messages in order in batches of 50 until none is left or
+a send fails, at most 1000 per register.
+
+**Connections.** `Relay:MaxConnections` (default 1000, env `Relay__MaxConnections`) caps open
+WebSocket connections; it's also Kestrel's `MaxConcurrentUpgradedConnections`.
+`Relay:MaxConnectionsPerIp` (default 16, env `Relay__MaxConnectionsPerIp`) caps connections from one
+client address (IPv6: one /64). Over either cap, the WebSocket upgrade is answered with HTTP 503.
+
+Behind Tailscale Funnel every connection comes from tailscaled on loopback, so the client's address
+can only come from a header. The relay trusts only `X-Forwarded-For` (its last entry), and only
+when the TCP peer is loopback: tailscaled's serve proxy sets it to the Funnel connection's source,
+replacing anything the client sent. `Tailscale-Ingress-Src` is never used, since a client can send
+it itself and tailscaled doesn't strip it. A connection without a usable `X-Forwarded-For` gets no
+per-IP cap at all (only the global one), so a missing header can't make everyone share one cap of
+16. **The per-IP cap depends on this header, which still needs a live check through the real Funnel**
+(see `plans/IN-GAME-CHECKS.md` in the plugin repo). If the relay is bound to a non-loopback address,
+the TCP peer's own address is used and headers are ignored.
+
+**Events.** Every event added for these limits (`message_too_big`, `binary_message`,
+`register_timeout`, `register_required`, `routed_too_big`, `queue_full`, `outbox_row_too_big`) and
+`rate_limited` is recorded at most once per key every 5 minutes (once for all unregistered
+connections together). An event records a message type only when it's a known one, otherwise
+`unknown`.
+
+No protocol version change: `queue_full` is the only new code a client can receive. Deploy this
+relay before the plugin release that goes with it.

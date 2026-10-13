@@ -1,3 +1,4 @@
+using System.Text;
 using Microsoft.Data.Sqlite;
 using WindUpKey.Protocol;
 
@@ -608,6 +609,10 @@ internal sealed class RelayStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Inserts a row as is, without the 03-D6 limits. The hub queues through <see cref="TryEnqueueOutbox"/>; this is
+    /// for seeding rows (tests, and rows an older relay could have queued).
+    /// </summary>
     public long EnqueueOutbox(
         string? requestId,
         string fromKey,
@@ -624,12 +629,10 @@ internal sealed class RelayStore : IDisposable
     }
 
     /// <summary>
-    /// Like <see cref="EnqueueOutbox"/>, unless a row of <paramref name="msgType"/> from <paramref name="fromKey"/> to
-    /// <paramref name="toKey"/> is still pending (and unexpired). Returns the new row's id, or null when one was.
-    /// First, in the same transaction, deletes the pending rows of <paramref name="supersedes"/> from
-    /// <paramref name="fromKey"/> to <paramref name="toKey"/>, even when nothing new is queued: an
-    /// <c>ownerRevoked</c> drops the <c>ownerGrant</c> rows queued before it, so the one-copy rule can't deliver a grant
-    /// after a later revoke (02-D31).
+    /// <see cref="TryEnqueueOutbox"/> with <c>once</c>: unless a row of <paramref name="msgType"/> from
+    /// <paramref name="fromKey"/> to <paramref name="toKey"/> is still pending (and unexpired). Returns the new row's id,
+    /// or null when nothing was queued (one was pending, or a 03-D6 limit refused it). See there for
+    /// <paramref name="supersedes"/>.
     /// </summary>
     public long? EnqueueOutboxOnce(
         string? requestId,
@@ -640,6 +643,66 @@ internal sealed class RelayStore : IDisposable
         TimeSpan ttl,
         string? supersedes = null)
     {
+        var result = TryEnqueueOutbox(requestId, fromKey, toKey, msgType, envelopeJson, ttl, once: true, supersedes, out var id);
+        return result == OutboxEnqueueStatus.Queued ? id : null;
+    }
+
+    /// <summary>
+    /// Message types exempt from the 03-D6 quotas, so a removal or a pairing is never lost to a full queue. They are
+    /// neither refused for nor counted in a quota (each has its own one-copy or one-per-pair rule).
+    /// </summary>
+    public static bool IsQuotaExempt(string msgType) =>
+        msgType is MessageTypes.OwnerRevoked or MessageTypes.PairRemove or MessageTypes.PairEstablished;
+
+    /// <inheritdoc cref="TryEnqueueOutbox(string?, string, string, string, string, TimeSpan, bool, string?, out long)"/>
+    public OutboxEnqueueStatus TryEnqueueOutbox(
+        string? requestId,
+        string fromKey,
+        string toKey,
+        string msgType,
+        string envelopeJson,
+        TimeSpan ttl,
+        bool once = false,
+        string? supersedes = null) =>
+        TryEnqueueOutbox(requestId, fromKey, toKey, msgType, envelopeJson, ttl, once, supersedes, out _);
+
+    /// <summary>
+    /// Queues a row within the 03-D6 limits, all in one transaction:
+    /// <list type="number">
+    /// <item>A row over <see cref="WireLimits.OutboxRowBytes"/> is refused (<see cref="OutboxEnqueueStatus.RowTooBig"/>).</item>
+    /// <item>
+    /// The pending rows of <paramref name="supersedes"/> from <paramref name="fromKey"/> to <paramref name="toKey"/> are
+    /// deleted, even when nothing new is queued: an <c>ownerRevoked</c> drops the <c>ownerGrant</c> rows queued before
+    /// it, so the one-copy rule can't deliver a grant after a later revoke (02-D31).
+    /// </item>
+    /// <item>
+    /// With <paramref name="once"/>, nothing is queued while a row of <paramref name="msgType"/> from
+    /// <paramref name="fromKey"/> to <paramref name="toKey"/> is still pending and unexpired
+    /// (<see cref="OutboxEnqueueStatus.AlreadyPending"/>).
+    /// </item>
+    /// <item>
+    /// Unless <see cref="IsQuotaExempt"/>, the newest row is refused (<see cref="OutboxEnqueueStatus.QuotaFull"/>) while
+    /// <see cref="WireLimits.OutboxPerSender"/> quota-counted rows from <paramref name="fromKey"/> to
+    /// <paramref name="toKey"/>, or <see cref="WireLimits.OutboxPerRecipient"/> for <paramref name="toKey"/>, are pending.
+    /// </item>
+    /// </list>
+    /// <paramref name="id"/> is the new row's id when <see cref="OutboxEnqueueStatus.Queued"/>.
+    /// </summary>
+    public OutboxEnqueueStatus TryEnqueueOutbox(
+        string? requestId,
+        string fromKey,
+        string toKey,
+        string msgType,
+        string envelopeJson,
+        TimeSpan ttl,
+        bool once,
+        string? supersedes,
+        out long id)
+    {
+        id = 0;
+        if (Encoding.UTF8.GetByteCount(envelopeJson) > WireLimits.OutboxRowBytes)
+            return OutboxEnqueueStatus.RowTooBig;
+
         lock (_gate)
         {
             ExpireLocked();
@@ -660,9 +723,10 @@ internal sealed class RelayStore : IDisposable
                 del.ExecuteNonQuery();
             }
 
-            long? id = null;
-            using (var cmd = conn.CreateCommand())
+            var status = OutboxEnqueueStatus.Queued;
+            if (once)
             {
+                using var cmd = conn.CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText =
                     """
@@ -672,13 +736,43 @@ internal sealed class RelayStore : IDisposable
                 cmd.Parameters.AddWithValue("$from", fromKey);
                 cmd.Parameters.AddWithValue("$to", toKey);
                 cmd.Parameters.AddWithValue("$type", msgType);
-                if ((long)(cmd.ExecuteScalar() ?? 0L) == 0)
-                    id = InsertOutbox(conn, tx, requestId, fromKey, toKey, msgType, envelopeJson, ttl);
+                if ((long)(cmd.ExecuteScalar() ?? 0L) != 0)
+                    status = OutboxEnqueueStatus.AlreadyPending;
             }
 
+            if (status == OutboxEnqueueStatus.Queued && !IsQuotaExempt(msgType) && QuotaFull(conn, tx, fromKey, toKey))
+                status = OutboxEnqueueStatus.QuotaFull;
+
+            if (status == OutboxEnqueueStatus.Queued)
+                id = InsertOutbox(conn, tx, requestId, fromKey, toKey, msgType, envelopeJson, ttl);
+
+            // Committed whatever was queued: the supersede delete stands on its own (02-D31).
             tx.Commit();
-            return id;
+            return status;
         }
+    }
+
+    /// <summary>Whether the 03-D6 quotas are reached, counting pending rows that aren't quota-exempt. In the caller's transaction.</summary>
+    private static bool QuotaFull(SqliteConnection conn, SqliteTransaction tx, string fromKey, string toKey)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText =
+            """
+            SELECT COUNT(*), COALESCE(SUM(from_key = $from), 0) FROM outbox
+            WHERE to_key = $to AND status = 'pending'
+              AND msg_type NOT IN ($ownerRevoked, $pairRemove, $pairEstablished);
+            """;
+        cmd.Parameters.AddWithValue("$from", fromKey);
+        cmd.Parameters.AddWithValue("$to", toKey);
+        cmd.Parameters.AddWithValue("$ownerRevoked", MessageTypes.OwnerRevoked);
+        cmd.Parameters.AddWithValue("$pairRemove", MessageTypes.PairRemove);
+        cmd.Parameters.AddWithValue("$pairEstablished", MessageTypes.PairEstablished);
+        using var reader = cmd.ExecuteReader();
+        reader.Read();
+        var forRecipient = reader.GetInt64(0);
+        var fromSender = reader.GetInt64(1);
+        return fromSender >= WireLimits.OutboxPerSender || forRecipient >= WireLimits.OutboxPerRecipient;
     }
 
     private static long InsertOutbox(
@@ -889,24 +983,35 @@ internal sealed class RelayStore : IDisposable
     }
 
     /// <summary>Atomically permits at most one wind request per pairing key per cooldown period.</summary>
-    public bool TryConsumeWindRequest(string pairingKey, TimeSpan cooldown)
+    public bool TryConsumeWindRequest(string pairingKey, TimeSpan cooldown) =>
+        TryConsumeWindRequest(pairingKey, cooldown, out _);
+
+    /// <summary>
+    /// Atomically permits at most one wind request per pairing key per cooldown period. When permitted,
+    /// <paramref name="refund"/> can give the cooldown back with <see cref="RefundWindRequest"/> (03-D18: a request the
+    /// recipient's full queue refused).
+    /// </summary>
+    public bool TryConsumeWindRequest(string pairingKey, TimeSpan cooldown, out WindRequestRefund refund)
     {
+        refund = default;
         var now = DateTimeOffset.UtcNow;
         lock (_gate)
         {
             using var conn = Open();
             using var tx = conn.BeginTransaction();
             DateTimeOffset? lastRequest = null;
+            string? previousRaw = null;
             using (var select = conn.CreateCommand())
             {
                 select.Transaction = tx;
                 select.CommandText =
                     "SELECT last_request_utc FROM wind_request_cooldowns WHERE pairing_key = $key;";
                 select.Parameters.AddWithValue("$key", pairingKey);
-                if (select.ExecuteScalar() is string raw
-                    && TryParseUtc(raw, out var parsed))
+                if (select.ExecuteScalar() is string raw)
                 {
-                    lastRequest = parsed;
+                    previousRaw = raw;
+                    if (TryParseUtc(raw, out var parsed))
+                        lastRequest = parsed;
                 }
             }
 
@@ -932,7 +1037,33 @@ internal sealed class RelayStore : IDisposable
             }
 
             tx.Commit();
+            refund = new WindRequestRefund(pairingKey, now.ToString("O"), previousRaw);
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Gives back a cooldown taken by <see cref="TryConsumeWindRequest(string, TimeSpan, out WindRequestRefund)"/>:
+    /// restores the previous stamp (or none), but only while the row still holds the stamp that call wrote, so a later
+    /// request's cooldown is never undone.
+    /// </summary>
+    public void RefundWindRequest(WindRequestRefund refund)
+    {
+        if (refund.PairingKey is null)
+            return;
+
+        lock (_gate)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = refund.PreviousUtc is null
+                ? "DELETE FROM wind_request_cooldowns WHERE pairing_key = $key AND last_request_utc = $mine;"
+                : "UPDATE wind_request_cooldowns SET last_request_utc = $previous WHERE pairing_key = $key AND last_request_utc = $mine;";
+            cmd.Parameters.AddWithValue("$key", refund.PairingKey);
+            cmd.Parameters.AddWithValue("$mine", refund.ConsumedUtc);
+            if (refund.PreviousUtc is not null)
+                cmd.Parameters.AddWithValue("$previous", refund.PreviousUtc);
+            cmd.ExecuteNonQuery();
         }
     }
 
@@ -1066,6 +1197,27 @@ internal sealed class RelayStore : IDisposable
     private static bool TryParseUtc(string raw, out DateTimeOffset value)
         => SyncStamp.TryParse(raw, out value);
 }
+
+/// <summary>What <see cref="RelayStore.TryEnqueueOutbox(string?, string, string, string, string, TimeSpan, bool, string?, out long)"/> did (03-D6).</summary>
+internal enum OutboxEnqueueStatus
+{
+    Queued,
+
+    /// <summary>A row of the type from the sender to the recipient is still pending (<c>once</c>).</summary>
+    AlreadyPending,
+
+    /// <summary>The sender's or the recipient's quota is reached: the newest message isn't queued.</summary>
+    QuotaFull,
+
+    /// <summary>The row is over <see cref="WireLimits.OutboxRowBytes"/>.</summary>
+    RowTooBig,
+}
+
+/// <summary>
+/// A wind request cooldown taken by <see cref="RelayStore.TryConsumeWindRequest(string, TimeSpan, out WindRequestRefund)"/>,
+/// for <see cref="RelayStore.RefundWindRequest"/>: the stamp it wrote, and the one it replaced (null: none).
+/// </summary>
+internal readonly record struct WindRequestRefund(string? PairingKey, string? ConsumedUtc, string? PreviousUtc);
 
 /// <summary>What <see cref="RelayStore.RemovePair"/> did: whether a pair or pending submit existed, and how many outbox rows went.</summary>
 internal readonly record struct PairRemoval(bool Removed, int Purged);

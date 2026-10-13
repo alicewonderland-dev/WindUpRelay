@@ -439,15 +439,19 @@ public sealed partial class SessionHubTests
     /// </summary>
     private static readonly TimeSpan ShortOfTheDefaultSendTimeout = SessionHub.DefaultSendTimeout - TimeSpan.FromMilliseconds(500);
 
-    /// <summary>A wind whose forwarded frame is far bigger than a stuck client's buffers, so the relay's send to it blocks.</summary>
-    private static WindPayload BigWind(string to) => new() { RequestId = new string('w', 2 * 1024 * 1024), To = to, Hours = 1 };
+    /// <summary>
+    /// A wind for a stuck client. 03-D4 caps every field (a forward can no longer be bigger than a stuck client's
+    /// buffers), so the stuck client's writes are stalled instead (<see cref="RegisterStuckAsync"/>).
+    /// </summary>
+    private static WindPayload StuckWind(string to) => new() { RequestId = "stuck-" + Guid.NewGuid().ToString("N"), To = to, Hours = 1 };
 
-    /// <summary>A registered client that never reads, so the relay's sends to it soon block.</summary>
+    /// <summary>A registered client that never reads, so the relay's next send to it blocks.</summary>
     private async Task<TestClient> RegisterStuckAsync(SessionHub hub, string key)
     {
         var stuck = await ConnectAsync(hub, reading: false);
         await stuck.RegisterAsync(key, null);
         await Task.Delay(200);
+        stuck.StallRelayWrites();
         return stuck;
     }
 
@@ -460,7 +464,7 @@ public sealed partial class SessionHubTests
         var recipient = await RegisterStuckAsync(hub, Peer);
         Pair(Key, Peer);
 
-        var wind = BigWind(Peer);
+        var wind = StuckWind(Peer);
         await sender.SendAsync(MessageTypes.Wind, wind);
         Assert.Null(await sender.NextAsync(Quiet));
 
@@ -489,7 +493,7 @@ public sealed partial class SessionHubTests
         var recipient = await RegisterStuckAsync(hub, Peer);
         Pair(Key, Peer);
 
-        var wind = BigWind(Peer);
+        var wind = StuckWind(Peer);
         await sender.SendAsync(MessageTypes.Wind, wind);
         await Task.Delay(Quiet);
 
@@ -517,7 +521,7 @@ public sealed partial class SessionHubTests
         Pair(Key, Peer);
 
         var started = DateTime.UtcNow;
-        await sender.SendAsync(MessageTypes.Wind, BigWind(Peer));
+        await sender.SendAsync(MessageTypes.Wind, StuckWind(Peer));
 
         // Counted as offline after the timeout: queued, and the sender's loop goes on. The wait leaves a loaded
         // machine plenty of time, but ends short of the 5 s default, so it's this hub's timeout that applied.
@@ -544,8 +548,8 @@ public sealed partial class SessionHubTests
         var wedged = await RegisterStuckAsync(hub, Peer);
         Pair(Key, Peer);
 
-        // The wedged client provokes a reply to itself too big to buffer (a not_allowed echoing its requestId).
-        await wedged.SendAsync(MessageTypes.Wind, BigWind(Offline));
+        // The wedged client provokes a reply to itself (a not_allowed for its requestId), which it doesn't read.
+        await wedged.SendAsync(MessageTypes.Wind, StuckWind(Offline));
 
         // Aborted after this hub's timeout, not the 5 s default.
         var ended = await Task.WhenAny(wedged.ServerTask, Task.Delay(ShortOfTheDefaultSendTimeout));
