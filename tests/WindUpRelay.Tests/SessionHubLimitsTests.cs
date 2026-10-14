@@ -29,6 +29,16 @@ public sealed partial class SessionHubTests
         return (long)cmd.ExecuteScalar()!;
     }
 
+    // The relay marks a row delivered after the live send returns, so a count read right after
+    // the client gets its frame can still see the row as pending. Poll briefly instead.
+    private async Task AssertCountEventuallyAsync(long expected, Func<long> count)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (count() != expected && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
+        Assert.Equal(expected, count());
+    }
+
     private List<string?> EventMsgTypes(string kind)
     {
         using var conn = new SqliteConnection($"Data Source={_dbPath}");
@@ -386,7 +396,7 @@ public sealed partial class SessionHubTests
 
         Assert.Equal(1, CountPending(Offline, MessageTypes.OwnerRevoked));
         Assert.Equal(1, CountPending(Offline, MessageTypes.PairRemove));
-        Assert.Equal(1, CountPending(Offline, MessageTypes.PairEstablished));
+        await AssertCountEventuallyAsync(1, () => CountPending(Offline, MessageTypes.PairEstablished));
     }
 
     [Fact]
@@ -434,7 +444,7 @@ public sealed partial class SessionHubTests
         var expected = Enumerable.Range(0, 70).Select(i => $"k{i:D3}").Concat(Enumerable.Range(0, 70).Select(i => $"o{i:D3}")).ToList();
         foreach (var id in expected)
             Assert.Equal(id, (await peer.ExpectTypeAsync(MessageTypes.Wind)).GetPayload<WindPayload>()!.RequestId);
-        Assert.Equal(0, CountPending(Peer));
+        await AssertCountEventuallyAsync(0, () => CountPending(Peer));
     }
 
     // ---- 03-D7 / 03-D8: rate limit and events ----
