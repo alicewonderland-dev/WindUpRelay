@@ -10,35 +10,21 @@ public protocol project at:
 
 `..\WindUpKey.Protocol\WindUpKey.Protocol.csproj`
 
-## Local configuration
+## Configuration
 
 `appsettings.Production.json` is intentionally ignored because it contains the
-relay token. Create and maintain that file locally; never commit it.
+relay token. Keep it on the relay host, with a private copy off the host; never
+commit it.
 
 Build explicitly with:
 
 `dotnet build WindUpRelay.csproj -c Release`
 
-## Linux
+## Running the relay
 
-`WindUpRelay.Host` is Windows-only. Use the Linux host GUI from the plugin repo root:
-
-```bash
-./Start-WindUpHost.sh
-```
-
-That opens a Start/Stop window, starts the Production relay on `:29417`, and enables
-Tailscale Funnel (same flow as the Windows tray host).
-
-Terminal-only alternative:
-
-```bash
-./Start-WindUpRelay.sh           # Production relay on :29417
-./Start-WindUpRelay.sh --funnel  # also enable Tailscale Funnel
-```
-
-Requires the .NET SDK, `Relay:Token` in `appsettings.Production.json`, and
-(for Funnel) the Tailscale CLI with Funnel allowed.
+The relay runs on one host, an Oracle Cloud VM (`windup-relay-oracle`) behind
+Tailscale Funnel, with no standby. `HOSTING.md` says how to run, update, back up
+and rebuild it.
 
 ## Relay identity (`Relay:AuthMode`)
 
@@ -73,7 +59,7 @@ characters). The relay records `register_key_switch_refused` at most once per ke
 
 ### Rollout order
 
-1. Deploy the relay with `AuthMode` `Bind` on every host. Old clients keep working.
+1. Deploy the relay with `AuthMode` `Bind`. Old clients keep working.
 2. Ship the client that sends a secret. Each character claims its key on first connect;
    pairs, consent, wind and queued messages stay keyed by the pairing key and carry over.
 3. Keep `Bind` for about 1–2 weeks, then switch to `Enforce`.
@@ -87,8 +73,6 @@ fixed with `reset-account` (below).
 An old client whose key has been claimed is refused silently and keeps retrying. The relay
 records `register_refused` (and logs it) at most once per key every 5 minutes, so these
 retries don't flush the event history.
-
-The hosts don't share a database, so a character claims its key separately on each host.
 
 ### Resetting an account
 
@@ -169,14 +153,14 @@ which the plugin's debug self-pair uses):
 * A message whose payload can't be read (wrong JSON types) is dropped (`payload_malformed`, recorded
   at most once per key every 5 minutes). The sender's connection stays open.
 
-The plugin re-submits its partners on every connect, so pairs rebuild themselves. A fresh relay host
-(for example a standby with an empty database) carries winds and other messages between two partners
-only after both of them have connected to it once. Nobody needs to pair again.
+The plugin re-submits its partners on every connect, so pairs rebuild themselves. A relay with an
+empty database (for example one rebuilt without a backup) carries winds and other messages between two
+partners only after both of them have connected to it once. Nobody needs to pair again.
 
-**Rollout order:** deploy this relay on every host before shipping the plugin release that goes with
-it, as for relay identity above. The protection against forged replies (`from`) and against
-messages between keys that aren't paired lives in the relay: a new plugin on an old relay still
-works, but isn't protected.
+**Rollout order:** deploy this relay before shipping the plugin release that goes with it, as for
+relay identity above. The protection against forged replies (`from`) and against messages between
+keys that aren't paired lives in the relay: a new plugin on an old relay still works, but isn't
+protected.
 
 ## Message and resource limits
 
