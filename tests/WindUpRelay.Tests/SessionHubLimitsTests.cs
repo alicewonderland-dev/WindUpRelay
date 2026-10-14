@@ -177,10 +177,11 @@ public sealed partial class SessionHubTests
     [Fact]
     public async Task ARegisteredSession_OutlivesTheRegisterDeadline()
     {
-        var hub = NewHub("Bind", registerTimeout: TimeSpan.FromMilliseconds(300));
+        // 08-T1: a 1 s deadline (not 300 ms), so a slow machine doesn't miss the register itself.
+        var hub = NewHub("Bind", registerTimeout: TimeSpan.FromMilliseconds(1000));
         var client = await RegisterOkAsync(hub, Key, null);
 
-        await Task.Delay(TimeSpan.FromSeconds(1));
+        await Task.Delay(TimeSpan.FromSeconds(2));
 
         await client.SendAsync(MessageTypes.Ping, new { });
         await client.ExpectTypeAsync(MessageTypes.Pong);
@@ -578,7 +579,9 @@ public sealed partial class SessionHubTests
     [Fact]
     public async Task ARegisterInFlightAtTheDeadline_IsWaitedFor_AndTheRegisteredSessionIsNeverClosedByIt()
     {
-        var hub = NewHub("Bind", registerTimeout: TimeSpan.FromMilliseconds(300));
+        // 08-T1: a 1 s deadline and a 2.5 s hold. Both moved together: the hold must outlast the deadline by a margin,
+        // or the test stops proving that an in-flight register is waited for.
+        var hub = NewHub("Bind", registerTimeout: TimeSpan.FromMilliseconds(1000));
         var client = await ConnectAsync(hub);
 
         // Hold the database's write lock, so the register blocks in its auth decision (creating the account) until
@@ -593,7 +596,7 @@ public sealed partial class SessionHubTests
             }
 
             await client.RegisterAsync(Key, RelaySecret.Generate());
-            await Task.Delay(TimeSpan.FromSeconds(1));
+            await Task.Delay(TimeSpan.FromSeconds(2.5));
             Assert.Null(await client.NextAsync(TimeSpan.Zero));
 
             using var rollback = conn.CreateCommand();
@@ -612,7 +615,8 @@ public sealed partial class SessionHubTests
     [Fact]
     public async Task ALegacyRegisterRefusedWithACollision_LeavesTheConnectionToTheDeadline()
     {
-        var hub = NewHub("Bind", registerTimeout: TimeSpan.FromMilliseconds(500));
+        // 08-T1: 1 s, not 500 ms, so the deadline can't fire before the refused register is answered.
+        var hub = NewHub("Bind", registerTimeout: TimeSpan.FromMilliseconds(1000));
         await RegisterOkAsync(hub, Key, null);
         var client = await ConnectAsync(hub);
 

@@ -19,10 +19,10 @@ internal static class AdminCli
     /// then <paramref name="args"/>). Blank (empty or whitespace-only) arguments are ignored throughout.
     /// <para>
     /// When it is there, either <paramref name="key"/> is the normalized pairing key, or <paramref name="error"/>
-    /// says why the command can't run (the command given twice, a bare `--`, no key, an invalid key, or an argument
+    /// says why the command can't run (the command given twice, a bare `--` or `/`, no key, an invalid key, or an argument
     /// besides the key that the host can't place). When it isn't, <paramref name="error"/> is set if the host's
-    /// arguments have one it can't place: a positional argument (the server takes none) or an unknown option whose
-    /// name contains "reset", either most likely a mistyped command. Whenever <paramref name="error"/> is set, the
+    /// arguments have one it can't place: a positional argument (the server takes none), an unknown option whose
+    /// name contains "reset", either most likely a mistyped command, or a single-dash `-x=y` (08-D3). Whenever <paramref name="error"/> is set, the
     /// caller exits with code 2 without starting the host.
     /// </para>
     /// </summary>
@@ -62,11 +62,11 @@ internal static class AdminCli
             return true;
         }
 
-        // The host reads a bare `--` as an empty name that takes the next argument as its value, so whatever
-        // follows it would be silently swallowed.
-        if (Array.IndexOf(args, "--") >= 0)
+        // The host reads a bare `--` (or `/`, `"-- "`, `"/ "`) as an empty name that takes the next argument as its
+        // value, so whatever follows it would be silently swallowed (08-C1.1).
+        if (args.Any(IsNamelessOption))
         {
-            error = "A bare -- can't be used with reset-account.";
+            error = "A bare -- or / can't be used with reset-account.";
             return true;
         }
 
@@ -120,6 +120,24 @@ internal static class AdminCli
     private static bool IsBlank(string arg) => string.IsNullOrWhiteSpace(arg);
 
     /// <summary>
+    /// 08-C1.1: an option the host reads as an empty (or blank) name taking the next argument as its value: `--` or
+    /// `/` followed by nothing but whitespace, with no `=`. A single `-` isn't one (the host ignores it), and `--=x`
+    /// or `/=x` take no value.
+    /// </summary>
+    private static bool IsNamelessOption(string arg)
+    {
+        if (arg.Contains('='))
+            return false;
+        if (arg.StartsWith("--", StringComparison.Ordinal))
+            return string.IsNullOrWhiteSpace(arg[2..]);
+        return arg.StartsWith('/') && string.IsNullOrWhiteSpace(arg[1..]);
+    }
+
+    /// <summary>08-C1.2 (D3): a single-dash option with a value (`-x=y`, `-=y`), which the host refuses by throwing.</summary>
+    private static bool IsSingleDashWithValue(string arg) =>
+        arg.StartsWith('-') && !arg.StartsWith("--", StringComparison.Ordinal) && arg.Contains('=');
+
+    /// <summary>
     /// Normalizes a pairing key given on the command line. It may contain only letters, digits, `-` and spaces (so
     /// `Mode=Bind`, `a:b` or `/x.db` are never taken for one) and must normalize to 8 letters or digits.
     /// </summary>
@@ -144,23 +162,26 @@ internal static class AdminCli
 
     /// <summary>
     /// Why the host can't place an argument in <paramref name="args"/>, or null: the first positional argument (one
-    /// that isn't an option or an option's value) or the first unknown option whose name contains "reset". Read the
-    /// way the host's command-line configuration reads them: `name=value`, `--name=value` and `/name=value` stand
-    /// alone; `--name value` and `/name value` take the next argument as the value (never checked, so
-    /// `--contentRoot /srv/reset` is fine); a lone `-x` takes none; blank arguments are skipped. A bare `--` is read
-    /// as taking no value, unlike the host (which reads it as an empty name and takes the next argument as its
-    /// value), so `-- extra` is still refused on a server start; a reset command refuses a bare `--` outright.
+    /// that isn't an option or an option's value) or the first unknown option (one whose name contains "reset", or a
+    /// single-dash `-x=y`). Read the way the host's command-line configuration reads them: `name=value`,
+    /// `--name=value` and `/name=value` stand alone; `--name value` and `/name value` take the next argument as the
+    /// value (never checked, so `--contentRoot /srv/reset` is fine); a lone `-x` takes none; blank arguments are
+    /// skipped. A bare `--` is read as the host reads it, an empty name taking the next argument as its value
+    /// (08-D1), so `-- extra` starts the server and `-- --environment Production` is refused; a reset command refuses
+    /// a bare `--` or `/` outright. A single-dash `-x=y`, which the host would throw on, is an unknown option (08-D3).
     /// </summary>
     private static string? UnplacedArgument(string[] args)
     {
         for (var i = 0; i < args.Length; i++)
         {
             var arg = args[i];
-            if (IsBlank(arg) || arg == "--")
+            if (IsBlank(arg))
                 continue;
             if (OptionName(arg) is { } name
                 && name.Contains("reset", StringComparison.OrdinalIgnoreCase)
                 && !IsCommand(arg, out _))
+                return $"Unknown option: {arg}";
+            if (IsSingleDashWithValue(arg) && !IsCommand(arg, out _))
                 return $"Unknown option: {arg}";
             if (arg.Contains('='))
                 continue;

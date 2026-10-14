@@ -23,7 +23,10 @@ public class AdminCliTests
         Assert.False(AdminCli.TryTakeResetAccount(["--reset-accounts=ABCD1234"], out _, out _, out _));
     }
 
-    /// <summary>Server starts with options are unchanged: nothing to refuse, everything goes to the host.</summary>
+    /// <summary>
+    /// Server starts with options are unchanged: nothing to refuse, everything goes to the host. 08-D1: a bare `--`
+    /// (or `/`) takes the next argument, as the host reads it, so `-- extra` is accepted again.
+    /// </summary>
     [Theory]
     [InlineData("--environment Production")]
     [InlineData("--environment Development Relay:AuthMode=Bind")]
@@ -32,7 +35,9 @@ public class AdminCliTests
     [InlineData("--Relay:DatabasePath=/x.db /Relay:Token=x Relay:AuthMode=Off")]
     [InlineData("-x --environment Production")]
     [InlineData("--environment Production --")]
-    [InlineData("-- --environment Production")]
+    [InlineData("-- extra")]
+    [InlineData("/ extra")]
+    [InlineData("--environment Production -- extra")]
     [InlineData("--environment Production --Relay:Token")]
     [InlineData("--contentRoot /srv/reset-relay --urls http://127.0.0.1:29417")]
     [InlineData("/contentRoot /srv/reset --Relay:DatabasePath=/var/reset/relay.db Relay:Token=reset")]
@@ -45,7 +50,10 @@ public class AdminCliTests
         Assert.Equal(args, rest);
     }
 
-    /// <summary>The server takes no positional arguments, so a mistyped command can't start it.</summary>
+    /// <summary>
+    /// The server takes no positional arguments, so a mistyped command can't start it. 08-D1: `-- --environment
+    /// Production` leaves `Production` positional (the host would have started in Development).
+    /// </summary>
     [Theory]
     [InlineData("reset-acount ABCD1234")]
     [InlineData("resetaccount ABCD1234")]
@@ -54,7 +62,8 @@ public class AdminCliTests
     [InlineData("--environment Production extra")]
     [InlineData("Production")]
     [InlineData("-x extra")]
-    [InlineData("-- extra")]
+    [InlineData("-- --environment Production")]
+    [InlineData("/ --environment Production")]
     public void PositionalArgument_WithoutTheCommand_IsRefused(string commandLine)
     {
         var args = Split(commandLine);
@@ -189,6 +198,9 @@ public class AdminCliTests
 
     /// <summary>Decision 41: the host would read a bare `--` as an empty name swallowing the next argument.</summary>
     [Theory]
+    [InlineData("reset-account ABCD1234 /")]
+    [InlineData("reset-account ABCD1234 / --Relay:DatabasePath=/x.db")]
+    [InlineData("/ reset-account ABCD1234")]
     [InlineData("reset-account ABCD1234 --")]
     [InlineData("reset-account ABCD1234 -- --Relay:DatabasePath=/x.db")]
     [InlineData("reset-account ABCD1234 -- WXYZ9876")]
@@ -200,6 +212,61 @@ public class AdminCliTests
         Assert.True(AdminCli.TryTakeResetAccount(Split(commandLine), out var key, out _, out var error));
         Assert.Null(key);
         Assert.Contains("bare --", error);
+    }
+
+    /// <summary>08-C1.1: a blank option name (`"-- "`, `"/ "`) swallows the next argument just like a bare `--`.</summary>
+    [Theory]
+    [InlineData("-- ")]
+    [InlineData("/ ")]
+    [InlineData("--\t")]
+    [InlineData("/")]
+    public void NamelessOption_WithTheCommand_IsAnError(string nameless)
+    {
+        Assert.True(AdminCli.TryTakeResetAccount(
+            ["reset-account", "ABCD1234", nameless, "--Relay:DatabasePath=/x.db"], out var key, out _, out var error));
+        Assert.Null(key);
+        Assert.StartsWith("A bare --", error);
+        Assert.True(AdminCli.TryTakeResetAccount([nameless, "reset-account", "ABCD1234"], out key, out _, out error));
+        Assert.Null(key);
+        Assert.StartsWith("A bare --", error);
+    }
+
+    /// <summary>
+    /// 08-C1.1: only `--` and `/` with a blank name are nameless. A single `-` is ignored by the host, and `--=x` or
+    /// `/=x` take no value.
+    /// </summary>
+    [Theory]
+    [InlineData("reset-account ABCD1234 -")]
+    [InlineData("reset-account ABCD1234 - --environment Production")]
+    [InlineData("reset-account ABCD1234 --=x")]
+    [InlineData("reset-account ABCD1234 /=x")]
+    public void OtherBlankishOptions_WithTheCommand_AreAllowed(string commandLine)
+    {
+        Assert.True(AdminCli.TryTakeResetAccount(Split(commandLine), out var key, out _, out var error));
+        Assert.Null(error);
+        Assert.Equal("ABCD1234", key);
+    }
+
+    /// <summary>08-C1.2 (D3): the host throws on a single-dash `-x=y`, so it's refused with or without the command.</summary>
+    [Theory]
+    [InlineData("-x=y")]
+    [InlineData("-=x")]
+    [InlineData("--environment Production -x=y")]
+    [InlineData("-Relay:Token=x --environment Production")]
+    public void SingleDashWithAValue_IsAnUnknownOption(string commandLine)
+    {
+        var args = Split(commandLine);
+        Assert.False(AdminCli.TryTakeResetAccount(args, out var key, out var rest, out var error));
+        Assert.Null(key);
+        Assert.StartsWith("Unknown option: -", error);
+        Assert.Equal(args, rest);
+
+        Assert.True(AdminCli.TryTakeResetAccount(["reset-account", "ABCD1234", .. args], out key, out _, out error));
+        Assert.Null(key);
+        Assert.StartsWith("Unknown option: -", error);
+        Assert.True(AdminCli.TryTakeResetAccount([.. args, "--reset-account=ABCD1234"], out key, out _, out error));
+        Assert.Null(key);
+        Assert.StartsWith("Unknown option: -", error);
     }
 
     [Theory]
@@ -359,6 +426,9 @@ public sealed class AdminCliEntryPointTests : IDisposable
     [InlineData("-reset-acount ABCD1234")]
     [InlineData("--environment Development --Reset-Acount=ABCD1234")]
     [InlineData("reset-account ABCD1234 --reset-acount WXYZ9876")]
+    [InlineData("reset-account ABCD1234 /")]
+    [InlineData("reset-account ABCD1234 -x=y")]
+    [InlineData("--environment Development -x=y")]
     public void BadCommandLines_Exit2_WithoutStartingTheHost_AndResetNothing(string commandLine)
     {
         Directory.CreateDirectory(_dir);

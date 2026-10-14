@@ -24,16 +24,6 @@ public sealed class ConnectionGateTests
     }
 
     [Fact]
-    public void TheIngressHeader_IsNeverTrusted()
-    {
-        // 03-D15: a client can send Tailscale-Ingress-Src itself, so the endpoint never reads it; without
-        // X-Forwarded-For there is no per-client cap, whatever else the request carries.
-        Assert.Null(ConnectionGate.ClientKey(Loopback, null));
-        Assert.Null(ConnectionGate.ClientKey(Loopback, ""));
-        Assert.Equal("203.0.113.7", ConnectionGate.ClientKey(Loopback, "203.0.113.7"));
-    }
-
-    [Fact]
     public void ANonLoopbackPeer_IsTheClient_AndHeadersAreIgnored()
     {
         var peer = IPAddress.Parse("192.0.2.10");

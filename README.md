@@ -110,13 +110,20 @@ the configuration as usual. It may also be written `--reset-account <PAIRINGKEY>
 It doesn't start the web host. Exit code `0` means the account was deleted, `1` means there
 was no such account (or no database), and `2` means bad arguments: a missing or invalid key
 (the key may contain only letters, digits, `-` and spaces), the command given more than once,
-a bare `--`, another argument that isn't an option or an option's value, or an unknown option
-whose name contains `reset`. Empty arguments are ignored. Pairs, consent, wind and the outbox
-are untouched. A session that is already connected stays connected until it reconnects.
+an option with no name (a bare `--` or `/`, which would swallow the next argument), another
+argument that isn't an option or an option's value, an unknown option whose name contains
+`reset`, or a single-dash option with a value (`-x=y`). Empty arguments are ignored. Pairs,
+consent, wind and the outbox are untouched. A session that is already connected stays
+connected until it reconnects.
 
 The server itself takes no such arguments either: if one is given (for example a mistyped
-`reset-acount <PAIRINGKEY>`, `--reset-acount <PAIRINGKEY>` or `reset-acount=<PAIRINGKEY>`),
-the relay prints usage and exits with code `2` instead of starting.
+`reset-acount <PAIRINGKEY>`, `--reset-acount <PAIRINGKEY>` or `reset-acount=<PAIRINGKEY>`, or
+a single-dash `-x=y`), the relay prints usage and exits with code `2` instead of starting.
+Arguments are read the way the host reads them, so a bare `--` takes the next argument as its
+value: `-- extra` starts the server, while `-- --environment Production` leaves `Production`
+on its own and is refused. Only these mistakes are caught. A typo whose name doesn't contain
+`reset` (for example `--enviroment Production`), or one that lands in an option's value slot,
+is passed to the configuration and the server starts as usual, so check the options you give.
 
 Run `reset-account` only right before the affected user reconnects. Once a key is reset,
 anyone with the shared token can claim it again, so the first register with a secret wins.

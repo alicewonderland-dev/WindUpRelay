@@ -8,10 +8,10 @@ using WindUpKey.Protocol;
 // Admin CLI: `reset-account <PAIRINGKEY>` uses the server's configuration but never starts the host.
 // It is recognised anywhere in the arguments (also as --reset-account, -reset-account, /reset-account and
 // reset-account=KEY); its own are stripped so the rest (e.g. --environment Production, before or after it) still
-// reach the builder. The command given twice, a bare `--` with it, a missing or invalid key, or any argument the host
-// can't place (a positional one, as the server takes none, or an unknown option containing "reset", so
-// `reset-acount KEY` and `--reset-acount KEY` are refused too) exits 2 before the builder is even created. Blank
-// arguments are ignored.
+// reach the builder. The command given twice, a bare `--` or `/` with it, a missing or invalid key, or any argument
+// the host can't place (a positional one, as the server takes none, or an unknown option containing "reset", so
+// `reset-acount KEY` and `--reset-acount KEY` are refused too, or a single-dash `-x=y` the host would throw on,
+// 08-C1) exits 2 before the builder is even created. Blank arguments are ignored.
 string? resetAccountKey = null;
 var isResetCommand = AdminCli.TryTakeResetAccount(args, out var resetKey, out var hostArgs, out var argsError);
 if (argsError is not null)
@@ -994,7 +994,6 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
-                RequestId = payload?.RequestId,
                 Code = ErrorCodes.BadRequest,
                 Message = "invalid presence query",
             }), ct);
@@ -1077,7 +1076,6 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
-                RequestId = payload?.RequestId,
                 Code = ErrorCodes.BadRequest,
                 Message = "invalid unwind payload",
             }), ct);
@@ -1264,7 +1262,6 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
-                RequestId = payload?.RequestId,
                 Code = ErrorCodes.BadRequest,
                 Message = "invalid ownerSettingsQuery payload",
             }), ct);
@@ -1307,7 +1304,6 @@ internal sealed class SessionHub(ILogger log, RelayStore store, int maxMessagesP
         {
             await session.SendAsync(Envelope.Create(MessageTypes.Error, new ErrorPayload
             {
-                RequestId = payload?.RequestId,
                 Code = ErrorCodes.BadRequest,
                 Message = "invalid ownerSettingsUpdate payload",
             }), ct);
